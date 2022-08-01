@@ -1,0 +1,24 @@
+X1/turbo SASI DRIVE READ / WRITE test driver
+
+SASI HDD の READ/WRITEを行うテストドライバです
+
+ソフトウェアエミュレータ、または実機+SASI-HDDエミュレータ専用で
+最低限の機能を最小構成で実装してあります。
+
+CZ-500H用はバスリセット後に初期化コマンドを発行することと
+電源OFF前にリトラクトを行う必要があるため未対応です。
+他の実HDDもリトラクトの問題で未対応です。
+
+sasi_tx/sasi_rxがポーリングタイプなのでX1/turbo/Z全期種で動きます。
+X1の場合はDMARQ信号がNMI割り込み信号になるので、I/Fカードのジャンパピンで
+DMARQを無効にするか、メモリの0066H番地にRETN命令を配置します。
+
+ArdSCSino-stm32の場合は"./scsi-config.txt"でモード設定が必要
+　４行目(Mode): "1" (X1turbo)
+　５行目(Wait): "0" (0 が推奨)
+
+・履歴
+
+2022. 7.28
+　・送信時 REQ=0 でハングするバグfix( ArdSCSino-stm32で発覚）
+　・ラッパをhddd.asmに統合して不要なファイルを削除
