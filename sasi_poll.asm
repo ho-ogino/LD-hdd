@@ -187,11 +187,11 @@ sasi_close:
 ;out
 ;	CF  : 1=timeout
 ;	A   : SASI receive data
-sasi_rx_phase_byte;
+sasi_rx_phase_byte:
 	call	wait_sasi
 	ret	c
 	ld	a,high IO_SASI_DATA
-	in	a,(LOW IO_SASI_DATA)
+	in	a,(low IO_SASI_DATA)
 	or	a		;CF=0
 	ret
 

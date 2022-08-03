@@ -54,7 +54,7 @@ start:
 	jr	nz,registhddd
 	jp	hdddcmd-TOP+0x100
 
-registhddd;
+registhddd:
 ;
 	; DRIVE F のDPBをHDDのもので上書きしてみる
 	ld	hl,hdddpb-TOP+0x100		; コピー元のHDD用DPB
@@ -107,7 +107,7 @@ hddrvok:
 	ld	hl,DPBADR+0x13
 	ld	(hl),a		; 直代入でもいいが、将来DPB位置が動く事を想定しているのでHLで処理しておく
 
-	add	0x30		; ドライブ名文字列の数字も変更しておく(HDD0～HDD3)
+	add	a,0x30		; ドライブ名文字列の数字も変更しておく(HDD0～HDD3)
 	ld	hl,DPBADR+0x1f
 	ld	(hl),a
 
@@ -186,7 +186,7 @@ numloop:
 
 cmderr:
 	scf
-cmdend;
+cmdend:
 	ret
 
 ; b = error number
