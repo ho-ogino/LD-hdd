@@ -212,7 +212,7 @@ hder2:
 	db	7,'Invalid offset number$'
 
 hdrgmsg:
-	db	'LD HDD controller v0.01', 0x0d,0x0a, '$'
+	db	'LD HDD controller v0.03', 0x0d,0x0a, '$'
 
 
 	; HDD DPBのコピー元
@@ -283,8 +283,6 @@ HDWTC:
 HDRDC:
 	ld	a,08h			;READ(6)
 HDRWC:
-	push ix
-	ld	ix,0eda0h		;Drive F: DPB(決め打ち)
 	push de
 	push hl
 	push	af			;SASI CMD
@@ -325,7 +323,6 @@ HDRWC:
 	jr	c,sasi_err
 	pop hl
 	pop de
-	pop ix
 	inc h		;memory addressを進める
 	inc h
 	inc h
@@ -344,7 +341,6 @@ sasi_transfer:
 sasi_err:
 	pop	hl
 	pop	de
-	pop	ix
 ;	scf
 	ret
 
