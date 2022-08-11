@@ -1,9 +1,10 @@
 ;----------------------------------------------------------------------------
 ; X1/turbo LSX-Dodgers SASI Access Program
 ; usage
-;   hdd [[drive] [offset]]
-;     drive: 0 - 3(HD0～HD3)
+;   hdd [hdd drive] [offset] [target drive]
+;     hdd drive: 0 - 3(HD0～HD3)
 ;     offset: 2MBごとのインデックス(1で2MBの位置、2で4MBの位置を先頭として処理する)
+;     tareget drive: A-G 割り当てるドライブ
 ;
 ;note:
 ; LSX-DodgersにてHDDをドライブに割り当て、読み書きするための常駐プログラムです。
@@ -35,9 +36,9 @@
 
 ;----------------------------------------------------------------------------
 ;
-TOP	equ	0xc700			; ORGの頭
-PROGSZ	equ	0x200			; 先頭(0x100)からの非常駐部のプログラムサイズ
-DPBADR	equ	0xEDA0			; F Drive DPB
+TOP		equ	0xc700			; ORGの頭
+PROGSZ		equ	0x200			; 先頭(0x100)からの非常駐部のプログラムサイズ
+DPBTOP		equ	0xed00			; DPB先頭(A:)
 
 ;------------------------------------
 		org	TOP+0x0000
@@ -55,19 +56,6 @@ start:
 	jp	hdddcmd-TOP+0x100
 
 registhddd:
-;
-	; DRIVE F のDPBをHDDのもので上書きしてみる
-	ld	hl,hdddpb-TOP+0x100		; コピー元のHDD用DPB
-	ld	de,0xEDA0			; F Drive DPB
-	ld	bc,32
-	ldir
-
-	; SASI読み書き処理をTPA末尾付近(0xc900)にコピーする
-	ld	hl,LDSYS-TOP+0x100	; COMが0x100に読まれるので、ここがLDSYSHDRDCの先頭になる
-	ld	de,0xc900
-	ld	bc,endadr-LDSYS
-	ldir
-
 	; TPA末尾を0xc900に動かす(不気味)
 	; まずは現状の値をコピー
 	ld	de,LDSYS+1
@@ -83,11 +71,61 @@ registhddd:
 	ld	a,0xc9
 	ld	(hl),a
 
+	; SASI読み書き処理をTPA末尾付近(0xc900)にコピーする
+	ld	hl,LDSYS-TOP+0x100	; COMが0x100に読まれるので、ここがLDSYSHDRDCの先頭になる
+	ld	de,0xc900
+	ld	bc,endadr-LDSYS
+	ldir
+
 	; これで常駐完了
 
 	; コマンドライン解析
-	; hddd [drive(0-3) block(2MB単位)]
+	; hddd [drive(0-3)] [block(2MB単位)] [target drive(A-G)]
 hdddcmd:
+	; コマンドライン末尾の文字がA-Gの場合ドライブ名として扱い、対象のDPB位置を特定する
+	; A-Gではない場合はデフォルト F: で処理する
+	ld	hl,0x80
+	ld	a,(hl)
+	add	a,l		; hl + hl + a
+	ld	l,a
+	ld	a,h
+	adc	a,0
+	ld	h,a
+	ld	a,(hl)
+	or	0x20
+	cp	'a'
+	jr	c,hddcmd1	; A以下のASCII CODEの場合は無視してデフォルトF:として処理する(微妙)
+	cp	'h'		; A,B,C,D,E,F,Gのみ許す
+	jr	c,hddcmd3ok
+
+	; 2: Target drive error
+	ld	c,2
+	jp	hdisperr-TOP+0x100
+hddcmd3ok:
+	and	0xdf
+	; 表示用にドライブ名を入れておく
+	ld	(targetdrv-TOP+0x100),a
+
+	; 指定ドライブのDPBアドレスを算出してdpbadrに入れる
+	sub	'A'
+	ld	l,a
+	ld	h,0
+	add	hl,hl		; 2
+	add	hl,hl		; 4
+	add	hl,hl		; 8
+	add	hl,hl		; 16
+	add	hl,hl		; 32
+	ld	bc,DPBTOP
+	add	hl,bc
+	ld	(dpbadr-TOP+0x100),hl
+
+hddcmd1:
+	; 任意のドライブのDPBをHDDのもので上書き
+	ld	hl,hdddpb-TOP+0x100		; コピー元のHDD用DPB
+	ld	de,(dpbadr-TOP+0x100)
+	ld	bc,32
+	ldir
+
 	ld	de,0x005d	; arg1
 	call	getnum-TOP+0x100
 	jr	nc,hddcmd2
@@ -104,15 +142,15 @@ hddcmd2:
 	jp	hdisperr-TOP+0x100
 hddrvok:
 	; Set Unit Number( HDD DRIVE Number 0-3 )
-	ld	hl,DPBADR+0x13
-	ld	(hl),a		; 直代入でもいいが、将来DPB位置が動く事を想定しているのでHLで処理しておく
+	ld	ix,(dpbadr-TOP+0x100)
+	ld	(ix+0x13),a
+
+	push	af
 
 	add	a,0x30		; ドライブ名文字列の数字も変更しておく(HDD0～HDD3)
-	ld	hl,DPBADR+0x1f
-	ld	(hl),a
+	ld	(ix+0x1f),a
 
 	ld	de,0x006d	; arg2
-	push	af
 	call	getnum-TOP+0x100
 	jr	nc,hddcmd3
 	pop	af
@@ -129,17 +167,23 @@ hddcmd3:
 	add	hl,hl	; 16
 	add	hl,hl	; 32
 	ex	de,hl
-	ld	hl,DPBADR+HDLBA1
-	ld	(hl),e
-	ld	hl,DPBADR+HDLBA2
-	ld	(hl),d
+	ld	(ix+HDLBA1),e
+	ld	(ix+HDLBA2),d
 
 	ld	de,hdrgmsg-TOP+0x100
 	ld	c,0x09
 	call	0005h
 
+	; ターゲットドライブを表示
+	ld	de,targetdrv-TOP+0x100
+	ld	c,0x09
+	call	0005h
+
+	; 割り当てるHDD名を表示
+	ld	hl,(dpbadr-TOP+0x100)
+	ld	bc,0x1c
+	add	hl,bc
 	ld	b,4
-	ld	hl,DPBADR+0x1c
 	ld	c,0x02
 hddndsp:
 	ld	e,(hl)
@@ -203,16 +247,26 @@ hdisperr:
 	scf
 	jp	0
 
+; 書き換え対象のDPBアドレス
+dpbadr:
+	DW	0xeda0
+
+; エラーメッセージ群
 hdermsg:
 	DW	hder1-TOP+0x100
 	DW	hder2-TOP+0x100
+	DW	hder3-TOP+0x100
 hder1:
 	db	7,'Invalid drive number$'
 hder2:
 	db	7,'Invalid offset number$'
+hder3:
+	db	7,'Invalid target drive$'
 
 hdrgmsg:
-	db	'LD HDD controller v0.03', 0x0d,0x0a, '$'
+	db	'LD HDD controller v0.05', 0x0d,0x0a, '$'
+targetdrv:
+	db	'F: $'
 
 
 	; HDD DPBのコピー元
@@ -286,8 +340,6 @@ HDRWC:
 	push de
 	push hl
 	push	af			;SASI CMD
-	; とりあえずHD3
-;	ld	a,3
 	ld	a,(ix+DPB_UNITNO)
 	call	sasi_set_drive
 ; deは1kb単位の数値だがsasi_*secsは256バイト単位なので4倍する
