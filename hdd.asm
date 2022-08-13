@@ -83,7 +83,7 @@ registhddd:
 	; hddd [drive(0-3)] [block(2MB単位)] [target drive(A-G)]
 hdddcmd:
 	; コマンドライン末尾の文字がA-Gの場合ドライブ名として扱い、対象のDPB位置を特定する
-	; A-Gではない場合はデフォルト F: で処理する
+	; A-Gではない場合はデフォルト H: で処理する
 	ld	hl,0x80
 	ld	a,(hl)
 	add	a,l		; hl + hl + a
@@ -247,9 +247,9 @@ hdisperr:
 	scf
 	jp	0
 
-; 書き換え対象のDPBアドレス
+; 書き換え対象のDPBアドレス(デフォルトドライブ H:)
 dpbadr:
-	DW	0xeda0
+	DW	0xede0
 
 ; エラーメッセージ群
 hdermsg:
@@ -266,7 +266,7 @@ hder3:
 hdrgmsg:
 	db	'LD HDD controller v0.05', 0x0d,0x0a, '$'
 targetdrv:
-	db	'F: $'
+	db	'H: $'
 
 
 	; HDD DPBのコピー元
