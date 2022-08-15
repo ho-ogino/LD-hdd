@@ -33,6 +33,40 @@
 ; あくまで現状、人柱版となります。
 ;
 
+;----------------------------------------------------------------------------
+; BPB情報
+;----------------------------------------------------------------------------
+; VHD(15MB)
+SCTSIZ		equ	512			; 1セクタのサイズ
+CSTSEC		equ	8			; 1クラスタのセクタ数(512*8なので4096バイト)
+RSVSEC		equ	8			; 予備領域のセクタ数
+NUMFAT		equ	2			; FATの数
+ROOTCNT		equ	512			; ルートエントリのディレクトリエントリの数
+TOTALSEC	equ	30720			; ボリュームの総セクタ数
+FATSZ		equ	12			; 1個のFATが占めるセクタ数
+HIDSEC		equ	128			; (VHDの)隠しセクタサイズ
+
+LDRSVSEC	equ	0x82			; LDの予備FAT領域の有無と論理セクタサイズ(予備あり、512バイト)
+
+;----------------------------------------------------------------------------
+; 2MB offset(1セクタ512バイト版。未検証)
+; SCTSIZ		equ	512			; 1セクタのサイズ
+; CSTSEC		equ	2			; 1クラスタのセクタ数(512*2で1024バイト)
+; RSVSEC		equ	2			; 予備領域のセクタ数
+; NUMFAT		equ	1			; FATの数
+; ROOTCNT		equ	512			; ルートエントリのディレクトリエントリの数
+; TOTALSEC	equ	4096		; ボリュームの総セクタ数
+; FATSZ		equ	6			; 1個のFATが占めるセクタ数
+; HIDSEC		equ	0			; (VHDの)隠しセクタサイズ
+
+; LDRSVSEC	equ	0x04			; LDの予備FAT領域の有無と論理セクタサイズ(予備なし、1024バイト)
+
+; LSX-Dodgers用にBPB情報から計算してやる
+TOTALCST	equ	TOTALSEC/CSTSEC
+FATHEAD		equ	HIDSEC+RSVSEC
+ROOTHEAD	equ	FATHEAD+FATSZ*NUMFAT
+ROOTTAIL	equ	ROOTHEAD+ROOTCNT*32/SCTSIZ
+DATAHEAD	equ	ROOTTAIL-2*CSTSEC
 
 ;----------------------------------------------------------------------------
 ;
@@ -264,47 +298,60 @@ hder3:
 	db	7,'Invalid target drive$'
 
 hdrgmsg:
-	db	'LD HDD controller v0.05', 0x0d,0x0a, '$'
+	db	'LD HDD controller v0.06', 0x0d,0x0a, '$'
 targetdrv:
 	db	'H: $'
 
 
-	; HDD DPBのコピー元
+; ■VHD(15MB)のBPB情報(参考)
+; BPB_BytsPerSec バイト単位のセクタサイズ: 512
+; BPB_SecPerClus クラスタを構成するセクタ数？: 8 → 4kb
+; BPB_RsvdSecCnt 予約領域のセクタ数: 8
+; BPB_NumFATs FATの数: 2
+; BPB_RootEntCnt ルートディレクトリに含まれるディレクトリエントリの数: 512
+; BPB_TotSec16 ボリュームの総セクタ数: 30720
+; BPB_Media: F8
+; BPB_FATSz16 1個のFATが占めるセクタ数: 12
+; BPB_SecPerTrk トラック当たりのセクタ数: 63
+; BPB_NumHeads ヘッド数: 255
+; BPB_HiddSec ストレージ上でこのボリュームの手前に存在する隠れた物理セクタの数: 128 ※128*512=64KBぶんがBPB手前の領域
+; BPB_TotSec32 ボリュームの総セクタ数: 0 ※BPB_TotSec16を見る事
+
+; HDD DPBのコピー元
 hdddpb:
-	DB	3	; +$00 FAT領域のセクタ単位でのサイズ(1byte) ★クラスタ数÷(1024 or 512(クラスタサイズ))×1.5の切り上げサイズが必要？2048なので3となる？
-	DB	$F8	; +$01 メディアバイト(HDD)
-	DW	HDRDC	; +$02 HLが書き込まれるメモリアドレス、DEが1を1kbとしたHDD読み込み位置？
-	DW	HDWTC	; +$04 HLが読み込みメモリアドレス、DEが1を1kbとしたHDD書き込み位置？
-	DB	9	; +$06 データ格納領域の先頭論理セクタ番号-2(1byte)、論理セクタとクラスタの関係(1byte)→0？？ ★つまり先頭から11KBの位置からデータが格納される
-	DB	1	; +$07 1クラスタの論理セクタ数(1,2,4,8,16のみ可)
-	DW	2048	; +$08 総クラスタ数 ★(FDDだと356だがとりあえず2048にしてみた……)
-	DB	0	; +$0A フロッピーディスクのモード(1byte)
-	DB	11	; +$0B ルートディレクトリ領域の終了の論理セクタ番号+1(1byte) ★つまり先頭から10KB目までがルートディレクトリ領域となる
+	DB	FATSZ		; +$00 FAT領域のセクタ単位でのサイズ(1byte)
+	DB	$F8		; +$01 メディアバイト(HDD)
+	DW	HDRDC		; +$02 HLが書き込まれるメモリアドレス、DEが1を1kbとしたHDD読み込み位置？
+	DW	HDWTC		; +$04 HLが読み込みメモリアドレス、DEが1を1kbとしたHDD書き込み位置？
+	DB	DATAHEAD	; +$06 データ格納領域の先頭論理セクタ番号-2クラスタ(1byte)
+	DB	CSTSEC		; +$07 1クラスタの論理セクタ数(1,2,4,8,16のみ可)
+	DW	TOTALCST	; +$08 総クラスタ数
+	DB	0		; +$0A フロッピーディスクのモード(1byte)
+	DB	ROOTTAIL	; +$0B ルートディレクトリ領域の終了の論理セクタ番号+1(1byte)
 HDDBL:
 HDLBA0		equ	$-hdddpb
-	DB	0	; +$0C LBA0 / フロッピーディスクのシリンダ数(1byte)
+	DB	0		; +$0C LBA0 / フロッピーディスクのシリンダ数(1byte)
 HDLBA1		equ	$-hdddpb
-	DB	0	; +$0D LBA1 / フロッピーディスクの1トラックのセクタ数(1byte)
-	DB	1	; +$0E FAT領域の先頭論理セクタ番号(1byte) これより前は予備(1KB)
-	DB	4	; +$0F 予備FAT領域と論理セクタのサイズ
-			;	上位1ビット:予備FAT領域
-			;		1:使用する
-			;		0:使用しない
-			; 下位4ビット: 論理セクタのサイズ
-			;	2:512バイト
-			;	4:1024バイト
-	DB	5	; +$10 ルートディレクトリ領域の先頭論理セクタ番号(1byte) ★つまり先頭から5KB～10KB目までがルートディレクトリ領域で、
-			; 領域が5KBあるので、5KB÷32で160ファイル置ける事になる。ちなみにFAT/FAT予備の直後にあれば良いため予備なしなら3でいい(予備ありなら6の方がいいが……)
+	DB	0		; +$0D LBA1 / フロッピーディスクの1トラックのセクタ数(1byte)
+	DB	FATHEAD		; +$0E FAT領域の先頭論理セクタ番号(1byte)
+	DB	LDRSVSEC	; +$0F 予備FAT領域と論理セクタのサイズ
+				;	上位1ビット:予備FAT領域
+				;		1:使用する
+				;		0:使用しない
+				;	下位4ビット: 論理セクタのサイズ
+				;		2:512バイト
+				;		4:1024バイト
+	DB	ROOTHEAD	; +$10 ルートディレクトリ領域の先頭論理セクタ番号(1byte)
 HDLBA2		equ	$-hdddpb
-	DB	1	; +$11 LBA2 / フロッピーディスクのセクタの最小値(1byte) ★LBA2として利用
-	DB	9	; +$12 Device Number?? ★？
+	DB	0		; +$11 LBA2 / フロッピーディスクのセクタの最小値(1byte) ★LBA2として利用
+	DB	9		; +$12 Device Number?? ★？
 DPB_UNITNO	equ	$-hdddpb
-HDDDV:	DB	3	; +$13 デバイスドライバ内におけるユニット番号(1byte)
-	DW	0	; +$14
-	DW	0	; GNCLデフォルトを使う ; +$16 FATの内容を読み出すルーチンの実行アドレス(2bytes)   ※ Fドライブのものを残すので使わない(が、この値で正しいはず)
-	DW	0	; SNCLデフォルトを使う ; +$18 FATにデータを書き込むルーチンの実行アドレス(2bytes) ※ 同上
-	DW	0	; +$1A カレントディレクトリのクラスタ番号(2bytes)
-	DB	"HDD0"  ; +$1C
+HDDDV:	DB	3		; +$13 デバイスドライバ内におけるユニット番号(1byte)
+	DW	0		; +$14
+	DW	0		; GNCLデフォルトを使う ; +$16 FATの内容を読み出すルーチンの実行アドレス(2bytes)   ※ Fドライブのものを残すので使わない(が、この値で正しいはず)
+	DW	0		; SNCLデフォルトを使う ; +$18 FATにデータを書き込むルーチンの実行アドレス(2bytes) ※ 同上
+	DW	0		; +$1A カレントディレクトリのクラスタ番号(2bytes)
+	DB	"HDD0"		; +$1C
 
 ;---------------------------------------------------------------------------
 ;SASI DRIVER
@@ -349,11 +396,9 @@ HDRWC:
 	push	af			;SASI CMD
 	ld	a,(ix+DPB_UNITNO)
 	call	sasi_set_drive
-; deは1kb単位の数値だがsasi_*secsは256バイト単位なので4倍する
+; deは512バイト単位の数値だがsasi_*secsは256バイト単位なので2倍する
 	ex de,hl
 	xor	a
-	add hl,hl
-	adc	a,a
 	add hl,hl
 	adc	a,a
 ;パーティションオフセットを加算
@@ -363,7 +408,7 @@ HDRWC:
 	adc	a,(ix+$11)	;LBA2/ フロッピーディスクのセクタの最小値
 ;SASIコマンドを構築
 	ld	e,a		;EHL = sasi LBA
-	ld	c,1024/256	;C   = block size
+	ld	c,512/256	;C   = block size
 	pop	af		;SASI CMD
 ;	call	sasi_setup_read6
 ;	call	sasi_setup_write6
@@ -374,7 +419,7 @@ HDRWC:
 ;SASIデータ転送
 	pop	hl		;HL = memory address
 	push hl
-	ld	de,1024		;DE = trasnfer size
+	ld	de,512		;DE = trasnfer size
 	call	sasi_transfer
 	jr	c,sasi_err
 ;SASIステータス、メッセージ、バスフリー
@@ -383,8 +428,6 @@ HDRWC:
 	pop hl
 	pop de
 	inc h		;memory addressを進める
-	inc h
-	inc h
 	inc h
 	inc de		;セクタ位置を進める
 	xor a
