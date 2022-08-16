@@ -38,14 +38,14 @@
 ; LDRSVSEC	equ	0x82			; LDの予備FAT領域の有無と論理セクタサイズ(予備あり、512バイト)
 
 ;----------------------------------------------------------------------------
-; 2MB offset(1セクタ512バイト版。未検証)
+; 2MB offset(1セクタ512バイト版)
 SCTSIZ		equ	512			; 1セクタのサイズ
 CSTSEC		equ	2			; 1クラスタのセクタ数(512*2で1024バイト)
 RSVSEC		equ	2			; 予備領域のセクタ数
 NUMFAT		equ	1			; FATの数
-ROOTCNT		equ	512			; ルートエントリのディレクトリエントリの数
+ROOTCNT		equ	160			; ルートエントリのディレクトリエントリの数
 TOTALSEC	equ	4096			; ボリュームの総セクタ数
-FATSZ		equ	6			; 1個のFATが占めるセクタ数
+FATSZ		equ	8			; 1個のFATが占めるセクタ数
 HIDSEC		equ	0			; (VHDの)隠しセクタサイズ
 
 LDRSVSEC	equ	0x02			; LDの予備FAT領域の有無と論理セクタサイズ(予備なし、512バイト)
@@ -55,7 +55,7 @@ TOTALCST	equ	TOTALSEC/CSTSEC
 FATHEAD		equ	HIDSEC+RSVSEC
 ROOTHEAD	equ	FATHEAD+FATSZ*NUMFAT
 ROOTTAIL	equ	ROOTHEAD+ROOTCNT*32/SCTSIZ
-DATAHEAD	equ	ROOTTAIL-2*CSTSEC
+DATAHEAD	equ	ROOTTAIL-2
 
 ;----------------------------------------------------------------------------
 ;
