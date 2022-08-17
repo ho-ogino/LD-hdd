@@ -46,7 +46,7 @@ X1用のSASIドライバは [すーぱーたーぼ @SuperturboZ](https://twitter
 # History
 
 
-* Version 0.06 (2022/8/18)
+* Version 0.06 (2022/8/17)
   * LSX-Dodgers 1.31以上必須
   * VHD形式に対応し、情報をBPBから取得するよう対応(BPBが得られない場合は従来と同様の挙動になります)
   * デフォルトドライブを H: に変更
