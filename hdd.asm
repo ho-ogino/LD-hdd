@@ -1,8 +1,9 @@
 ;----------------------------------------------------------------------------
 ; X1/turbo LSX-Dodgers SASI Access Program
 ; usage
-;   hdd [hdd drive] [target drive]
+;   hdd [hdd drive] [offset] [target drive]
 ;     hdd drive: 0 - 3(HD0～HD3)
+;     offset: 2MBごとのインデックス(1で2MBの位置、2で4MBの位置を先頭として処理する。VHDの場合は0固定にする事)
 ;     tareget drive: A-G 割り当てるドライブ
 ;
 ;note:
@@ -14,11 +15,13 @@
 ; C900にはJP 0xCC06(元々0x0006に書かれていたアドレス(LSX-Dodgersのシステム領域開始アドレス)) を書く事で強引に常駐させています。
 ; 正しい方法を知りたいところです……(リロケータブルにするのしんどいので固定にしてるのがダメ？)。
 ;
-; また、既存のDPB(ドライブパラメータブロック)をHDD用に上書きしているため、
+; 既存のDPB(ドライブパラメータブロック)をHDD用に上書きし、
 ; このプログラム実行後、任意の指定ドライブをHDDとしてアクセス出来るようになります。
 ;
 ; HDD用のDPBについては、VHD形式のファイルからBPB(BIOS Parameter Block)情報を読み込んで適切な値を設定します。
-; が、正常に全領域アクセス出来るか確認できていません。
+; BPBが見つからない場合は、デフォルト設定として2MBおきにHDDを区切って使う状態でDPBが設定されます。
+; 
+; 現時点で、正常に全領域アクセス出来るか確認できていません。
 ; あくまで現状、人柱版となります。
 ;
 
@@ -55,7 +58,7 @@ TOTALCST	equ	TOTALSEC/CSTSEC
 FATHEAD		equ	HIDSEC+RSVSEC
 ROOTHEAD	equ	FATHEAD+FATSZ*NUMFAT
 ROOTTAIL	equ	ROOTHEAD+ROOTCNT*32/SCTSIZ
-DATAHEAD	equ	ROOTTAIL-2
+DATAHEAD	equ	ROOTTAIL-2		; ここの計算若干怪しい(VHD版だと動かないと思われるのでBPBからの計算の方を正とする事)
 
 ;----------------------------------------------------------------------------
 ;
