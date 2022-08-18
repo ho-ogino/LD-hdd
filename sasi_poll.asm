@@ -174,8 +174,8 @@ sasi_close:
 	push	hl
 	ld	d,1Fh			;MSG IN,REQ
 	call	sasi_rx_phase_byte
-	ret	c
 	pop	hl
+	ret	c
 	ld	h,a
 	or	l
 	ret

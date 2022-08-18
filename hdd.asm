@@ -210,7 +210,7 @@ hddcmd3:
 	ld	bc,0x1c
 	add	hl,bc
 	ld	b,4
-	ld	c,0x02
+	ld	c,0x06
 hddndsp:
 	ld	e,(hl)
 	call	0x0005
@@ -220,6 +220,7 @@ hddndsp:
 
 ; BPBからDPBを設定する
 ; この時点でとりあえずSASIドライバの常駐はすんでいるので、直接ドライバの読み出し処理を使ってBPBを読み込む
+	di
 	ld	a,(ix+DPB_UNITNO)
 	call	sasi_set_drive
 
@@ -238,9 +239,11 @@ hddndsp:
 ;SASIステータス、メッセージ、バスフリー
 	call	sasi_close
 	jr	c,bpbrerr
+	ei
 	jr	bpbtodpb
 
 bpbrerr:
+	ei
 	ld	c,3
 	jp	hdisperr-TOP+0x100
 
@@ -511,6 +514,7 @@ HDWTC:
 HDRDC:
 	ld	a,08h			;READ(6)
 HDRWC:
+	di
 	push de
 	push hl
 	push	af			;SASI CMD
@@ -547,6 +551,7 @@ HDRWC:
 	jr	c,sasi_err
 	pop hl
 	pop de
+	ei
 	inc h		;memory addressを進める
 	inc h
 	inc de		;セクタ位置を進める
@@ -563,6 +568,7 @@ sasi_transfer:
 sasi_err:
 	pop	hl
 	pop	de
+	ei
 ;	scf
 	ret
 
