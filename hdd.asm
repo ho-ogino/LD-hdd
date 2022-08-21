@@ -57,8 +57,8 @@ LDRSVSEC	equ	0x02			; LD‚Ì—\”õFAT—Ìˆæ‚Ì—L–³‚Æ˜_—ƒZƒNƒ^ƒTƒCƒY(—\”õ‚È‚µA512ƒoƒCƒ
 TOTALCST	equ	TOTALSEC/CSTSEC
 FATHEAD		equ	HIDSEC+RSVSEC
 ROOTHEAD	equ	FATHEAD+FATSZ*NUMFAT
-ROOTTAIL	equ	ROOTHEAD+ROOTCNT*32/SCTSIZ
-DATAHEAD	equ	ROOTTAIL-2		; ‚±‚±‚ÌŒvŽZŽáŠ±‰ö‚µ‚¢(VHD”Å‚¾‚Æ“®‚©‚È‚¢‚ÆŽv‚í‚ê‚é‚Ì‚ÅBPB‚©‚ç‚ÌŒvŽZ‚Ì•û‚ð³‚Æ‚·‚éŽ–)
+ROOTSCNT	equ	ROOTCNT*32/SCTSIZ
+DATAHEAD	equ	ROOTHEAD+ROOTSCNT-2	; ‚±‚±‚ÌŒvŽZŽáŠ±‰ö‚µ‚¢(VHD”Å‚¾‚Æ“®‚©‚È‚¢‚ÆŽv‚í‚ê‚é‚Ì‚ÅBPB‚©‚ç‚ÌŒvŽZ‚Ì•û‚ð³‚Æ‚·‚éŽ–)
 
 ;----------------------------------------------------------------------------
 ;
@@ -254,87 +254,12 @@ bpbtodpb:
 	jr	z,bpbok
 	cp	$e9
 	jr	z,bpbok
+	cp	$60		;X68K
+	jr	z,bpbok
+	res	4,(ix+$12)	;DPB_01_DEVICE
 	jp	notbpb-TOP+0x100
 bpbok:
-	ld	a,(iy+16)	;BPB_NumFATs
-	cp	2		;0-1 C 2- NC
-	ccf
-	sbc	a,a
-	and	$80
-	or	(iy+12)		;BPB_BytsPerSec
-	ld	(ix+$0f),a	;DPB_0F_BPS
-
-	ld	a,(iy+13)	;BPB_SecPerClus
-	ld	(ix+7),a	;DPB_07_SECPCL
-
-	ld	c,(iy+14)	;BPB_RsvdSecCnt
-	ld	(ix+$0e),c	;DPB_0E_FATPS
-
-	ld	a,(iy+22)	;BPB_FATSz16
-	ld	(ix+0),a	;DPB_00_FATLN
-
-	ld	b,(iy+16)	;BPB_NumFATs
-	xor	a
-bpbdp1:				;a = BPB_FATSz16 * BPB_NumFATs
-	add	a,(iy+22)	;BPB_FATSz16
-	djnz	bpbdp1
-bpbdp2:
-	add	a,(ix+$0e)	;DPB_0E_FATPS
-	ld	(ix+$10),a	;DPB_10_DIRPS
-
-	ld	l,(iy+17)	;BPB_RootEntCnt
-	ld	h,(iy+18)
-	xor	a
-	add	hl,hl		;*2
-	adc	a,a
-	add	hl,hl		;*4
-	adc	a,a
-	add	hl,hl		;*8
-	adc	a,a
-	add	hl,hl		;*16
-	adc	a,a
-	add	hl,hl		;*32	;1ƒfƒBƒŒƒNƒgƒŠƒGƒ“ƒgƒŠ‚ÌƒTƒCƒY32ƒoƒCƒg
-	adc	a,a
-				;ahl = ƒfƒBƒŒƒNƒgƒŠƒGƒ“ƒgƒŠ‚ÌƒTƒCƒY(ƒoƒCƒg)
-	ld	b,(iy+12)	;BPB_BytsPerSec
-bpbde1:				;ƒfƒBƒŒƒNƒgƒŠƒGƒ“ƒgƒŠ‚ÌƒZƒNƒ^”@= ƒfƒBƒŒƒNƒgƒŠƒGƒ“ƒgƒŠ‚ÌƒTƒCƒY / BPB_BytsPerSec
-	rr	b
-	jr	c,bpbde2
-	srl	a
-	rr	h
-	rr	l
-	jr	bpbde1
-bpbde2:
-	ld	a,(ix+$10)	;DPB_10_DIRPS
-	add	a,h
-	ld	(ix+$0b),a	;DPB_0B_MAXDIR
-
-	ld	b,(iy+13)	;BPB_SecPerClus
-	sla	b
-	sub	b		;Žg‚í‚ê‚È‚¢0A‚PƒNƒ‰ƒXƒ^•ª
-	ld	(ix+6),a	;DPB_06_ADDCL
-
-	ld	l,(iy+19)	;BPB_TotSec16
-	ld	h,(iy+20)
-	ld	b,(iy+13)	;BPB_SecPerClus
-bpbtc1:				;‘ƒNƒ‰ƒXƒ^”@= ‘ƒZƒNƒ^” / ƒZƒNƒ^ƒTƒCƒY
-	rr	b
-	jr	c,bpbtc2
-	srl	h
-	rr	l
-	jr	bpbtc1
-bpbtc2:
-	dec	hl
-	dec	hl
-	dec	hl
-	dec	hl
-	dec	hl
-	dec	hl
-	ld	(ix+8),l	;DPB_08_MAXCL
-	ld	(ix+9),h
-
-	ld	a,(iy+21)	;BPB_Media
-	ld	(ix+1),a	;DPB_01_FATID
+	set	5,(ix+$12)	;DPB_01_DEVICE
 
 	; ‰B‚µƒZƒNƒ^‚Ô‚ñ64KB(ŒÅ’è‚È‚Ì‚Å’ˆÓ)‚ðLBA‚É‘«‚µ‚Ä‚¨‚¢‚Ä‚â‚é
 	ld	l,(ix+HDLBA1)
@@ -343,7 +268,6 @@ bpbtc2:
 	ld	(ix+HDLBA1),l
 	ld	(ix+HDLBA2),h
 notbpb:
-
 	; I—¹
 	jp	0
 
@@ -440,15 +364,14 @@ targetdrv:
 
 ; HDD DPB‚ÌƒRƒs[Œ³
 hdddpb:
-	DB	FATSZ		; +$00 FAT—Ìˆæ‚ÌƒZƒNƒ^’PˆÊ‚Å‚ÌƒTƒCƒY(1byte)
-	DB	$F8		; +$01 ƒƒfƒBƒAƒoƒCƒg(HDD)
+	DW	FATSZ		; +$00 FAT—Ìˆæ‚ÌƒZƒNƒ^’PˆÊ‚Å‚ÌƒTƒCƒY(1byte)
 	DW	HDRDC		; +$02 HL‚ª‘‚«ž‚Ü‚ê‚éƒƒ‚ƒŠƒAƒhƒŒƒXADE‚ª1‚ð1kb‚Æ‚µ‚½HDD“Ç‚Ýž‚ÝˆÊ’uH
 	DW	HDWTC		; +$04 HL‚ª“Ç‚Ýž‚Ýƒƒ‚ƒŠƒAƒhƒŒƒXADE‚ª1‚ð1kb‚Æ‚µ‚½HDD‘‚«ž‚ÝˆÊ’uH
-	DB	DATAHEAD	; +$06 ƒf[ƒ^Ši”[—Ìˆæ‚Ìæ“ª˜_—ƒZƒNƒ^”Ô†-2ƒNƒ‰ƒXƒ^(1byte) 0x30
+	DB	$F8		; +$06 ƒƒfƒBƒAƒoƒCƒg(HDD)
 	DB	CSTSEC		; +$07 1ƒNƒ‰ƒXƒ^‚Ì˜_—ƒZƒNƒ^”(1,2,4,8,16‚Ì‚Ý‰Â) 0x08
 	DW	TOTALCST	; +$08 ‘ƒNƒ‰ƒXƒ^” 0xefa
 	DB	0		; +$0A ƒtƒƒbƒs[ƒfƒBƒXƒN‚Ìƒ‚[ƒh(1byte)
-	DB	ROOTTAIL	; +$0B ƒ‹[ƒgƒfƒBƒŒƒNƒgƒŠ—Ìˆæ‚ÌI—¹‚Ì˜_—ƒZƒNƒ^”Ô†+1(1byte) 0x40
+	DB	ROOTSCNT	; +$0B ƒ‹[ƒgƒfƒBƒŒƒNƒgƒŠ—Ìˆæ‚ÌI—¹‚Ì˜_—ƒZƒNƒ^”Ô†+1(1byte) 0x40
 HDDBL:
 HDLBA0		equ	$-hdddpb
 	DB	0		; +$0C LBA0 / ƒtƒƒbƒs[ƒfƒBƒXƒN‚ÌƒVƒŠƒ“ƒ_”(1byte)
@@ -462,15 +385,14 @@ HDLBA1		equ	$-hdddpb
 				;	‰ºˆÊ4ƒrƒbƒg: ˜_—ƒZƒNƒ^‚ÌƒTƒCƒY
 				;		2:512ƒoƒCƒg
 				;		4:1024ƒoƒCƒg
-	DB	ROOTHEAD	; +$10 ƒ‹[ƒgƒfƒBƒŒƒNƒgƒŠ—Ìˆæ‚Ìæ“ª˜_—ƒZƒNƒ^”Ô†(1byte) 0x20
-HDLBA2		equ	$-hdddpb
-	DB	0		; +$11 LBA2 / ƒtƒƒbƒs[ƒfƒBƒXƒN‚ÌƒZƒNƒ^‚ÌÅ¬’l(1byte) šLBA2‚Æ‚µ‚Ä—˜—p
-	DB	9		; +$12 Device Number?? šH
+	DW	ROOTHEAD	; +$10 ƒ‹[ƒgƒfƒBƒŒƒNƒgƒŠ—Ìˆæ‚Ìæ“ª˜_—ƒZƒNƒ^”Ô†(1byte) 0x20
+	DB	$29		; +$12 Device Number?? š
 DPB_UNITNO	equ	$-hdddpb
 HDDDV:	DB	3		; +$13 ƒfƒoƒCƒXƒhƒ‰ƒCƒo“à‚É‚¨‚¯‚éƒ†ƒjƒbƒg”Ô†(1byte)
-	DW	0		; +$14
-	DW	0		; GNCLƒfƒtƒHƒ‹ƒg‚ðŽg‚¤ ; +$16 FAT‚Ì“à—e‚ð“Ç‚Ýo‚·ƒ‹[ƒ`ƒ“‚ÌŽÀsƒAƒhƒŒƒX(2bytes)   ¦ Fƒhƒ‰ƒCƒu‚Ì‚à‚Ì‚ðŽc‚·‚Ì‚ÅŽg‚í‚È‚¢(‚ªA‚±‚Ì’l‚Å³‚µ‚¢‚Í‚¸)
-	DW	0		; SNCLƒfƒtƒHƒ‹ƒg‚ðŽg‚¤ ; +$18 FAT‚Éƒf[ƒ^‚ð‘‚«ž‚Þƒ‹[ƒ`ƒ“‚ÌŽÀsƒAƒhƒŒƒX(2bytes) ¦ “¯ã
+	DW	DATAHEAD	; +$14 ƒf[ƒ^Ši”[—Ìˆæ‚Ìæ“ª˜_—ƒZƒNƒ^”Ô†-2ƒNƒ‰ƒXƒ^(1byte) 0x30
+	DW	0		; 
+HDLBA2		equ	$-hdddpb
+	DW	0		; +$11 -> +$18 LBA2 / ƒtƒƒbƒs[ƒfƒBƒXƒN‚ÌƒZƒNƒ^‚ÌÅ¬’l(1byte) šLBA2‚Æ‚µ‚Ä—˜—p
 	DW	0		; +$1A ƒJƒŒƒ“ƒgƒfƒBƒŒƒNƒgƒŠ‚ÌƒNƒ‰ƒXƒ^”Ô†(2bytes)
 	DB	"HDD0"		; +$1C
 
@@ -526,7 +448,7 @@ HDRWC:
 	ld	e,(ix+$0C)	;LBA0/ ƒtƒƒbƒs[ƒfƒBƒXƒN‚ÌƒVƒŠƒ“ƒ_”
 	ld	d,(ix+$0D)	;LBA1/ ƒtƒƒbƒs[ƒfƒBƒXƒN‚Ì1ƒgƒ‰ƒbƒN‚ÌƒZƒNƒ^”
 	add	hl,de
-	adc	a,(ix+$11)	;LBA2/ ƒtƒƒbƒs[ƒfƒBƒXƒN‚ÌƒZƒNƒ^‚ÌÅ¬’l
+	adc	a,(ix+$18)	;LBA2/ ƒtƒƒbƒs[ƒfƒBƒXƒN‚ÌƒZƒNƒ^‚ÌÅ¬’l
 ;SASIƒRƒ}ƒ“ƒh‚ð\’z
 	ld	e,a		;EHL = sasi LBA
 	ld	c,512/256	;C   = block size
