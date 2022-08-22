@@ -475,6 +475,8 @@ HDRWC:
 	inc h		;memory addressを進める
 	inc h
 	inc de		;セクタ位置を進める
+	ld a,d
+	or e
 	jr	nc,HDLBANC
 	inc c
 HDLBANC:
