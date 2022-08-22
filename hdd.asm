@@ -406,34 +406,35 @@ LDSYS:
 	JP	0xcc06		; このアドレスは常駐時にツブされる
 
 ;---------------------------------------------------------------------------
-;WRITE CRUSTER
+;WRITE CLUSTER
 ;in
 ;	IX   : DPB
-;	DE   : cruster number
+;	C DE : cluster number
 ;	HL   : memory address
 ;out
 ;	CF   : 0=no error,1=error
-;	DE   : next cruster
+;	C DE : next cluster
 ;	HL   : next address
 ;---------------------------------------------------------------------------
 HDWTC:
 	ld	a,0Ah			;WRITE(6)
-;	jr	HDRWC
-	db	0x01			;SKIP 2,BC
+	jr	HDRWC
+;	db	0x01			;SKIP 2,BC ※BCをツブしてはいけなくなったのでjrしておく
 ;---------------------------------------------------------------------------
-;READ CRUSTER
+;READ CLUSTER
 ;in
 ;	IX   : DPB
-;	DE   : cruster number
+;	C DE : cluster number
 ;	HL   : memory address
 ;out
 ;	CF   : 0=no error,1=error
-;	DE   : next cruster
+;	C DE : next cluster
 ;	HL   : next address
 ;---------------------------------------------------------------------------
 HDRDC:
 	ld	a,08h			;READ(6)
 HDRWC:
+	push bc
 	push de
 	push hl
 	push	af			;SASI CMD
@@ -441,7 +442,7 @@ HDRWC:
 	call	sasi_set_drive
 ; deは512バイト単位の数値だがsasi_*secsは256バイト単位なので2倍する
 	ex de,hl
-	xor	a
+	ld	a,c
 	add hl,hl
 	adc	a,a
 ;パーティションオフセットを加算
@@ -470,9 +471,13 @@ HDRWC:
 	jr	c,sasi_err
 	pop hl
 	pop de
+	pop bc
 	inc h		;memory addressを進める
 	inc h
 	inc de		;セクタ位置を進める
+	jr	nc,HDLBANC
+	inc c
+HDLBANC:
 	xor a
 	ret
 ;---------------------------------------------------------------------------
@@ -486,6 +491,7 @@ sasi_transfer:
 sasi_err:
 	pop	hl
 	pop	de
+	pop	bc
 ;	scf
 	ret
 
