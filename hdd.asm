@@ -477,7 +477,7 @@ HDRWC:
 	inc de		;セクタ位置を進める
 	ld a,d
 	or e
-	jr	nc,HDLBANC
+	jr	nz,HDLBANC
 	inc c
 HDLBANC:
 	xor a
