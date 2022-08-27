@@ -114,8 +114,8 @@ hdddcmd:
 	ld	a,(hl)
 	add	a,l		; hl + hl + a
 	ld	l,a
-	ld	a,h
-	adc	a,0
+	adc	a,h
+	sub	l
 	ld	h,a
 	ld	a,(hl)
 	or	0x20
@@ -223,8 +223,37 @@ hddndsp:
 	ld	a,(ix+DPB_UNITNO)
 	call	sasi_set_drive
 
+	ld	hl,0x0000		; IMG-先頭から読む(BPB先頭)
+	call	check_bpb-TOP+0x100
+	jp	nc,0
+
+	ld	hl,0x0100		; VHD-0x10000バイトから読む(BPB先頭。ただし先頭64KBが隠しセクタ固定(いいのかな))
+	call	check_bpb-TOP+0x100
+	jp	nc,0
+
+	ld	hl,0x007e		; IMG-0x07e00バイトから読む(MBR付き)
+	call	check_bpb-TOP+0x100
+	jp	nc,0
+
+	ld	hl,0x0098		; HDI-0x09800バイトから読む
+	call	check_bpb-TOP+0x100
+	jp	nc,0
+
+	ld	hl,0x0120		; HDI-0x12000バイトから読む
+	call	check_bpb-TOP+0x100
+	jp	nc,0
+
+	ld	hl,0x0202		; NHD-0x20200バイトから読む
+	call	check_bpb-TOP+0x100
+	jp	nc,0
+
+	; BPBをオフにする
+	res	4,(ix+$12)	;DPB_01_DEVICE
+	jp	0
+
+check_bpb:
+	push	hl
 	ld	a,08h			;READ
-	ld	hl,0x0100		; 0x10000バイトから読む(BPB先頭。ただし先頭64KBが隠しセクタ固定(いいのかな))
 	ld	e,0
 	ld	c,1			; C   = block size(BPBは1ブロック=256バイト以内に入る)
 	call	sasi_setup_rw6
@@ -238,12 +267,7 @@ hddndsp:
 ;SASIステータス、メッセージ、バスフリー
 	call	sasi_close
 	jr	c,bpbrerr
-	jr	bpbtodpb
-
-bpbrerr:
-	ei
-	ld	c,3
-	jp	hdisperr-TOP+0x100
+	pop	hl
 
 ;	0x4000からBPBが読まれている(はず)
 bpbtodpb:
@@ -251,25 +275,55 @@ bpbtodpb:
 
 	ld	a,(iy+0)	;BS_JmpBoot
 	cp	$eb
-	jr	z,bpbok
+	jr	z,bpbeb
 	cp	$e9
 	jr	z,bpbok
 	cp	$60		;X68K
-	jr	z,bpbok
-	res	4,(ix+$12)	;DPB_01_DEVICE
-	jp	notbpb-TOP+0x100
-bpbok:
-	set	5,(ix+$12)	;DPB_01_DEVICE
-
-	; 隠しセクタぶん64KB(固定なので注意)をLBAに足しておいてやる
-	ld	l,(ix+HDLBA1)
-	ld	h,(ix+HDLBA2)
-	inc	hl
-	ld	(ix+HDLBA1),l
-	ld	(ix+HDLBA2),h
+	jr	z,bpbeb
 notbpb:
-	; 終了
-	jp	0
+	scf
+	sbc	a,a
+	ret
+
+bpbrerr:
+	pop	hl
+	ei
+	ld	c,3
+	jp	hdisperr-TOP+0x100
+
+bpbeb:
+	ld	a,(iy+2)
+	cp	0x90
+	jr	nz,notbpb
+bpbok:
+	ld	a,(iy+12)	;BPB_BytsPerSec
+	or	a
+	jr	z,notbpb
+	ld	b,a
+	dec	b
+	and	b
+	jr	nz,notbpb
+
+	ld	a,(iy+13)	;BPB_SecPerClus
+	or	a
+	jr	z,notbpb
+	ld	b,a
+	dec	b
+	and	b
+	jr	nz,notbpb
+
+	set	5,(ix+$12)	;DPB_01_DEVICE
+	; 隠しセクタぶんをLBAに足しておいてやる
+	ld	e,(ix+HDLBA0)
+	ld	d,(ix+HDLBA1)
+	xor	a
+	add	hl,de
+	adc	a,(ix+HDLBA2)
+	ld	(ix+HDLBA0),l
+	ld	(ix+HDLBA1),h
+	ld	(ix+HDLBA2),a
+	xor	a
+	ret
 
 getnum:
 	ld	hl,0
@@ -368,7 +422,7 @@ hdddpb:
 	DW	HDRDC		; +$02 HLが書き込まれるメモリアドレス、DEが1を1kbとしたHDD読み込み位置？
 	DW	HDWTC		; +$04 HLが読み込みメモリアドレス、DEが1を1kbとしたHDD書き込み位置？
 	DB	$F8		; +$06 メディアバイト(HDD)
-	DB	CSTSEC		; +$07 1クラスタの論理セクタ数(1,2,4,8,16のみ可) 0x08
+	DB	CSTSEC		; +$07 1クラスタの論理セクタ数(1,2,4,8,16,32,64,128のみ可) 0x08
 	DW	TOTALCST	; +$08 総クラスタ数 0xefa
 	DB	0		; +$0A フロッピーディスクのモード(1byte)
 	DB	ROOTSCNT	; +$0B ルートディレクトリ領域の終了の論理セクタ番号+1(1byte) 0x40
@@ -382,7 +436,8 @@ HDLBA1		equ	$-hdddpb
 				;	上位1ビット:予備FAT領域
 				;		1:使用する
 				;		0:使用しない
-				;	下位4ビット: 論理セクタのサイズ
+				;	下位3ビット: 論理セクタのサイズ
+				;		1:256バイト
 				;		2:512バイト
 				;		4:1024バイト
 	DW	ROOTHEAD	; +$10 ルートディレクトリ領域の先頭論理セクタ番号(1byte) 0x20
@@ -439,20 +494,39 @@ HDRWC:
 	push hl
 	push	af			;SASI CMD
 	ld	a,(ix+DPB_UNITNO)
+	push bc
 	call	sasi_set_drive
-; deは512バイト単位の数値だがsasi_*secsは256バイト単位なので2倍する
+; deの単位に合わせて256バイト単位のsasi_*secsをn(1,2,4)倍する
 	ex de,hl
 	ld	a,c
+	LD	c,(IX+00FH)	;DPB_0F_BPS(bit0-2:1:256バイト 2:512バイト 4:1024バイト)
+mulsec1:
+	rr	c
+	jr	c,mulsec2
 	add hl,hl
 	adc	a,a
+	jr	mulsec1
+mulsec2:
+	pop bc
 ;パーティションオフセットを加算
 	ld	e,(ix+$0C)	;LBA0/ フロッピーディスクのシリンダ数
 	ld	d,(ix+$0D)	;LBA1/ フロッピーディスクの1トラックのセクタ数
 	add	hl,de
 	adc	a,(ix+$18)	;LBA2/ フロッピーディスクのセクタの最小値
+	jr	c,sasi_err2
 ;SASIコマンドを構築
 	ld	e,a		;EHL = sasi LBA
-	ld	c,512/256	;C   = block size
+	add	a,$100-$e0	;SASIの理論アドレスは21ビットなので超えたらエラー
+	jr	c,sasi_err2
+	ld	a,(ix+0x0f)	;DPB_0F_BPS(bit0-2:1:256バイト 2:512バイト 4:1024バイト)
+	and	7
+	ld	c,a		;C   = block size
+	xor	a
+mulblock:
+	add	a,c
+	djnz	mulblock
+	ld	c,a
+	ld	(tspat+2),a
 	pop	af		;SASI CMD
 ;	call	sasi_setup_read6
 ;	call	sasi_setup_write6
@@ -463,7 +537,7 @@ HDRWC:
 ;SASIデータ転送
 	pop	hl		;HL = memory address
 	push hl
-	ld	de,512		;DE = trasnfer size
+tspat:	ld	de,0x200	;DE = trasnfer size
 	call	sasi_transfer
 	jr	c,sasi_err
 ;SASIステータス、メッセージ、バスフリー
@@ -472,14 +546,18 @@ HDRWC:
 	pop hl
 	pop de
 	pop bc
-	inc h		;memory addressを進める
-	inc h
-	inc de		;セクタ位置を進める
-	ld a,d
-	or e
-	jr	nz,HDLBANC
-	inc c
-HDLBANC:
+	ld	a,(tspat+2)
+	add	a,h		;memory addressを進める
+	ld	h,a
+	ld	a,e		;セクタ位置を進める
+	add	a,b
+	ld	e,a
+	ld	a,d
+	adc	a,0
+	ld	d,a
+	adc	a,c
+	sub	d
+	ld	c,a
 	xor a
 	ret
 ;---------------------------------------------------------------------------
@@ -490,6 +568,8 @@ sasi_transfer:
 	jp	sasi_tx			;WRITE
 
 ;---------------------------------------------------------------------------
+sasi_err2:
+	pop	af
 sasi_err:
 	pop	hl
 	pop	de
