@@ -60,6 +60,9 @@ ROOTHEAD	equ	FATHEAD+FATSZ*NUMFAT
 ROOTSCNT	equ	ROOTCNT*32/SCTSIZ
 DATAHEAD	equ	ROOTHEAD+ROOTSCNT-2	; ここの計算若干怪しい(VHD版だと動かないと思われるのでBPBからの計算の方を正とする事)
 
+; LSX-Dodgers内部コール
+_BPB2DPB	equ	0xecf1
+
 ;----------------------------------------------------------------------------
 ;
 TOP		equ	0xc600			; ORGの頭
@@ -103,6 +106,14 @@ registhddd:
 	ld	bc,endadr-LDSYS
 	ldir
 
+	ld	a,i
+	ld	(BPB2DPB+2),a
+	ld	(b2dp1+2),a
+	ld	(b2dp2+2),a
+b2dp1:	ld	hl,(_BPB2DPB+1)
+	ld	(BPB2DPB+1),hl
+	ld	hl,bpb2dpb1
+b2dp2:	ld	(_BPB2DPB+1),hl
 	; これで常駐完了
 
 	; コマンドライン解析
@@ -459,6 +470,8 @@ HDLBA2		equ	$-hdddpb
 ; このアドレスが0x0006に書かれている。本来のシステムコールアドレスである0xcc06をここで呼ぶ(いいのかこれ)
 LDSYS:
 	JP	0xcc06		; このアドレスは常駐時にツブされる
+BPB2DPB:
+	JP	0
 
 ;---------------------------------------------------------------------------
 ;WRITE CLUSTER
@@ -576,6 +589,42 @@ sasi_err:
 	pop	bc
 ;	scf
 	ret
+
+
+bpb2dpb1:
+	call	BPB2DPB
+	ret	nc
+	LD	A,(IY+0)	;BS_JmpBoot
+	CP	0EBH		;Short jump
+	JR	Z,bpb2k
+	CP	0E9H		;Near jump
+	SCF
+	RET
+bpb2k:				;1セクタ2KB対策
+	LD	A,(IY+12)	;BPB_BytsPerSec
+	cp	8		;1セクタ2KB
+	scf
+	ret	nz
+	LD	A,(IX+00FH)	;DPB_0F_BPS
+	xor	0x0c
+	LD	(IX+00FH),A	;DPB_0F_BPS
+
+	sla	(IX+7)		;DPB_07_SECPCL
+
+	sla	(IX+0)		;DPB_00_FATLN
+	rl	(IX+1)		;DPB_00_FATLN
+
+	sla	(IX+00EH)	;DPB_0E_FATPS
+
+	sla	(IX+010H)	;DPB_10_DIRPS
+	rl	(IX+011H)
+
+	sla	(IX+00BH)	;DPB_0B_DIRSCNT
+
+	sla	(IX+014H)	;DPB_14_ADDCL16
+	rl	(IX+015H)
+	ret
+
 
 ;SASIドライバ本体
 	include	"sasi_poll.asm"
