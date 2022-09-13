@@ -106,7 +106,14 @@ registhddd:
 	ld	bc,endadr-LDSYS
 	ldir
 
-	ld	a,i
+	ld	c,0x6f		;MSX-DOS ‚Ìƒo[ƒWƒ‡ƒ“”Ô†‚ÌŠl“¾(_DOSVER)
+	call	0x0005
+	ld	hl,0x0138
+	and	a
+	sbc	hl,de
+	jr	nc,hdddcmd
+
+	ld	a,(0x000b)
 	ld	(BPB2DPB+2),a
 	ld	(b2dp1+2),a
 	ld	(b2dp2+2),a
