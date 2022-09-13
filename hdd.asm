@@ -60,6 +60,9 @@ ROOTHEAD	equ	FATHEAD+FATSZ*NUMFAT
 ROOTSCNT	equ	ROOTCNT*32/SCTSIZ
 DATAHEAD	equ	ROOTHEAD+ROOTSCNT-2	; ここの計算若干怪しい(VHD版だと動かないと思われるのでBPBからの計算の方を正とする事)
 
+; LSX-Dodgers内部コール
+_BPB2DPB	equ	0xecf1
+
 ;----------------------------------------------------------------------------
 ;
 TOP		equ	0xc600			; ORGの頭
@@ -67,7 +70,7 @@ PROGSZ		equ	0x300			; 先頭(0x100)からの非常駐部のプログラムサイズ
 DPBTOP		equ	0xed00			; DPB先頭(A:)
 
 ;------------------------------------
-		org	TOP+0x0000
+		org	0x0100
 ;----------------------------------------------------------------------------
 start:
 	; 常駐チェック(手抜き。0x0006に0xc900が書かれていれば常駐済とする……)
@@ -79,7 +82,7 @@ start:
 	ld	a,(hl)
 	cp	LDSYS/256
 	jr	nz,registhddd
-	jp	hdddcmd-TOP+0x100
+	jp	hdddcmd
 
 registhddd:
 	; TPA末尾を0xc900に動かす(不気味)
@@ -98,11 +101,26 @@ registhddd:
 	ld	(hl),a
 
 	; SASI読み書き処理をTPA末尾付近(0xc900)にコピーする
-	ld	hl,LDSYS-TOP+0x100	; COMが0x100に読まれるので、ここがLDSYSHDRDCの先頭になる
+	ld	hl,0x0100+PROGSZ	; COMが0x100に読まれるので、ここがLDSYSHDRDCの先頭になる
 	ld	de,0xc900
 	ld	bc,endadr-LDSYS
 	ldir
 
+	ld	c,0x6f		;MSX-DOS のバージョン番号の獲得(_DOSVER)
+	call	0x0005
+	ld	hl,0x0138
+	and	a
+	sbc	hl,de
+	jr	nc,hdddcmd
+
+	ld	a,(0x000b)
+	ld	(BPB2DPB+2),a
+	ld	(b2dp1+2),a
+	ld	(b2dp2+2),a
+b2dp1:	ld	hl,(_BPB2DPB+1)
+	ld	(BPB2DPB+1),hl
+	ld	hl,bpb2dpb1
+b2dp2:	ld	(_BPB2DPB+1),hl
 	; これで常駐完了
 
 	; コマンドライン解析
@@ -126,11 +144,11 @@ hdddcmd:
 
 	; 2: Target drive error
 	ld	c,2
-	jp	hdisperr-TOP+0x100
+	jp	hdisperr
 hddcmd3ok:
 	and	0xdf
 	; 表示用にドライブ名を入れておく
-	ld	(targetdrv-TOP+0x100),a
+	ld	(targetdrv),a
 
 	; 指定ドライブのDPBアドレスを算出してdpbadrに入れる
 	sub	'A'
@@ -143,21 +161,21 @@ hddcmd3ok:
 	add	hl,hl		; 32
 	ld	bc,DPBTOP
 	add	hl,bc
-	ld	(dpbadr-TOP+0x100),hl
+	ld	(dpbadr),hl
 
 hddcmd1:
 	; 任意のドライブのDPBをHDDのもので上書き
-	ld	hl,hdddpb-TOP+0x100		; コピー元のHDD用DPB
-	ld	de,(dpbadr-TOP+0x100)
+	ld	hl,hdddpb		; コピー元のHDD用DPB
+	ld	de,(dpbadr)
 	ld	bc,32
 	ldir
 
 	ld	de,0x005d	; arg1
-	call	getnum-TOP+0x100
+	call	getnum
 	jr	nc,hddcmd2
 	; 0: Drive number error
 	ld	c,0
-	jp	hdisperr-TOP+0x100
+	jp	hdisperr
 hddcmd2:
 	ld	a,l
 	; 0-3 check
@@ -165,10 +183,10 @@ hddcmd2:
 	jr	c,hddrvok
 	; 0: Drive number error
 	ld	c,0
-	jp	hdisperr-TOP+0x100
+	jp	hdisperr
 hddrvok:
 	; Set Unit Number( HDD DRIVE Number 0-3 )
-	ld	ix,(dpbadr-TOP+0x100)
+	ld	ix,(dpbadr)
 	ld	(ix+0x13),a
 
 	push	af
@@ -177,12 +195,12 @@ hddrvok:
 	ld	(ix+0x1f),a
 
 	ld	de,0x006d	; arg2
-	call	getnum-TOP+0x100
+	call	getnum
 	jr	nc,hddcmd3
 	pop	af
 	; 1: Offset number error
 	ld	c,1
-	jp	hdisperr-TOP+0x100
+	jp	hdisperr
 hddcmd3:
 	pop	af
 
@@ -196,17 +214,17 @@ hddcmd3:
 	ld	(ix+HDLBA1),e
 	ld	(ix+HDLBA2),d
 
-	ld	de,hdrgmsg-TOP+0x100
+	ld	de,hdrgmsg
 	ld	c,0x09
 	call	0005h
 
 	; ターゲットドライブを表示
-	ld	de,targetdrv-TOP+0x100
+	ld	de,targetdrv
 	ld	c,0x09
 	call	0005h
 
 	; 割り当てるHDD名を表示
-	ld	hl,(dpbadr-TOP+0x100)
+	ld	hl,(dpbadr)
 	ld	bc,0x1c
 	add	hl,bc
 	ld	b,4
@@ -224,27 +242,27 @@ hddndsp:
 	call	sasi_set_drive
 
 	ld	hl,0x0000		; IMG-先頭から読む(BPB先頭)
-	call	check_bpb-TOP+0x100
+	call	check_bpb
 	jp	nc,0
 
 	ld	hl,0x0100		; VHD-0x10000バイトから読む(BPB先頭。ただし先頭64KBが隠しセクタ固定(いいのかな))
-	call	check_bpb-TOP+0x100
+	call	check_bpb
 	jp	nc,0
 
 	ld	hl,0x007e		; IMG-0x07e00バイトから読む(MBR付き)
-	call	check_bpb-TOP+0x100
+	call	check_bpb
 	jp	nc,0
 
 	ld	hl,0x0098		; HDI-0x09800バイトから読む
-	call	check_bpb-TOP+0x100
+	call	check_bpb
 	jp	nc,0
 
 	ld	hl,0x0120		; HDI-0x12000バイトから読む
-	call	check_bpb-TOP+0x100
+	call	check_bpb
 	jp	nc,0
 
 	ld	hl,0x0202		; NHD-0x20200バイトから読む
-	call	check_bpb-TOP+0x100
+	call	check_bpb
 	jp	nc,0
 
 	; BPBをオフにする
@@ -289,7 +307,7 @@ bpbrerr:
 	pop	hl
 	ei
 	ld	c,3
-	jp	hdisperr-TOP+0x100
+	jp	hdisperr
 
 bpbeb:
 	ld	a,(iy+2)
@@ -367,7 +385,7 @@ cmdend:
 hdisperr:
 	ld	b,0
 	sla	c	; c = c * 2
-	ld	hl,hdermsg-TOP+0x100
+	ld	hl,hdermsg
 	add	hl,bc
 	ld	e,(hl)
 	inc	hl
@@ -383,10 +401,10 @@ dpbadr:
 
 ; エラーメッセージ群
 hdermsg:
-	DW	hder1-TOP+0x100
-	DW	hder2-TOP+0x100
-	DW	hder3-TOP+0x100
-	DW	hder4-TOP+0x100
+	DW	hder1
+	DW	hder2
+	DW	hder3
+	DW	hder4
 hder1:
 	db	7,'Invalid drive number$'
 hder2:
@@ -454,11 +472,13 @@ HDLBA2		equ	$-hdddpb
 ;---------------------------------------------------------------------------
 ;SASI DRIVER
 ;---------------------------------------------------------------------------
-	org	TOP+PROGSZ
+	org	TOP+PROGSZ,PROGSZ
 
 ; このアドレスが0x0006に書かれている。本来のシステムコールアドレスである0xcc06をここで呼ぶ(いいのかこれ)
 LDSYS:
 	JP	0xcc06		; このアドレスは常駐時にツブされる
+BPB2DPB:
+	JP	0
 
 ;---------------------------------------------------------------------------
 ;WRITE CLUSTER
@@ -576,6 +596,42 @@ sasi_err:
 	pop	bc
 ;	scf
 	ret
+
+
+bpb2dpb1:
+	call	BPB2DPB
+	ret	nc
+	LD	A,(IY+0)	;BS_JmpBoot
+	CP	0EBH		;Short jump
+	JR	Z,bpb2k
+	CP	0E9H		;Near jump
+	SCF
+	RET
+bpb2k:				;1セクタ2KB対策
+	LD	A,(IY+12)	;BPB_BytsPerSec
+	cp	8		;1セクタ2KB
+	scf
+	ret	nz
+	LD	A,(IX+00FH)	;DPB_0F_BPS
+	xor	0x0c
+	LD	(IX+00FH),A	;DPB_0F_BPS
+
+	sla	(IX+7)		;DPB_07_SECPCL
+
+	sla	(IX+0)		;DPB_00_FATLN
+	rl	(IX+1)		;DPB_00_FATLN
+
+	sla	(IX+00EH)	;DPB_0E_FATPS
+
+	sla	(IX+010H)	;DPB_10_DIRPS
+	rl	(IX+011H)
+
+	sla	(IX+00BH)	;DPB_0B_DIRSCNT
+
+	sla	(IX+014H)	;DPB_14_ADDCL16
+	rl	(IX+015H)
+	ret
+
 
 ;SASIドライバ本体
 	include	"sasi_poll.asm"
