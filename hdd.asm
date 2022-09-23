@@ -11,8 +11,8 @@
 ;
 ; 0x100から読み込まれるCOMファイルとしてバイナリ出力する前提で作っています。
 ; 
-; C900からSASIドライブ読み書き処理が配置され、TPAの末尾(0x0006)をC900に動かし、
-; C900にはJP 0xCC06(元々0x0006に書かれていたアドレス(LSX-Dodgersのシステム領域開始アドレス)) を書く事で強引に常駐させています。
+; cf06からSASIドライブ読み書き処理が配置され、TPAの末尾(0x0006)をcf06に動かし、
+; cf06にはJP 0xd106(元々0x0006に書かれていたアドレス(LSX-Dodgersのシステム領域開始アドレス)) を書く事で強引に常駐させています。
 ; 正しい方法を知りたいところです……(リロケータブルにするのしんどいので固定にしてるのがダメ？)。
 ;
 ; 既存のDPB(ドライブパラメータブロック)をHDD用に上書きし、
@@ -61,48 +61,48 @@ ROOTSCNT	equ	ROOTCNT*32/SCTSIZ
 DATAHEAD	equ	ROOTHEAD+ROOTSCNT-2	; ここの計算若干怪しい(VHD版だと動かないと思われるのでBPBからの計算の方を正とする事)
 
 ; LSX-Dodgers内部コール
-_BPB2DPB	equ	0xecf1
+_BPB2DPB	equ	0xf0f1
 
 ;----------------------------------------------------------------------------
 ;
-TOP		equ	0xc600			; ORGの頭
+LDSYS		equ	0xcf06			; 常駐アドレスの頭
+LDDEF		equ	0xd106			; 既定のLDのアドレス
 PROGSZ		equ	0x300			; 先頭(0x100)からの非常駐部のプログラムサイズ
-DPBTOP		equ	0xed00			; DPB先頭(A:)
 
 ;------------------------------------
 		org	0x0100
 ;----------------------------------------------------------------------------
 start:
-	; 常駐チェック(手抜き。0x0006に0xc900が書かれていれば常駐済とする……)
-	ld	hl,0x0006
-	ld	a,(hl)
+	; 常駐チェック(手抜き。0x0006に0xcf06が書かれていれば常駐済とする……)
+	ld	hl,(0x0006)
+	ld	a,l
 	cp	LDSYS & 0xff
 	jr	nz,registhddd
-	inc	hl
-	ld	a,(hl)
+	ld	a,h
 	cp	LDSYS/256
 	jr	nz,registhddd
 	jp	hdddcmd
 
 registhddd:
-	; TPA末尾を0xc900に動かす(不気味)
+	; 常駐チェック2(0x0006に0xd106が書かれていれば常駐する)
+	ld	a,l
+	cp	LDDEF & 0xff
+	jp	nz,0
+	ld	a,h
+	cp	LDDEF/256
+	jp	nz,0
+
+	; TPA末尾を0xcf06に動かす(不気味)
 	; まずは現状の値をコピー
-	ld	de,LDSYS+1
-	ld	hl,0x0006
-	ldi
-	ldi
+	ld	(LDSYS+1),hl
 
-	; 0x0006の中身を0xc900にする
-	ld	hl,0x0006
-	ld	a,0
-	ld	(hl),a
-	inc	hl
-	ld	a,0xc9
-	ld	(hl),a
+	; 0x0006の中身を0xcf06にする
+	ld	hl,LDSYS
+	ld	(0x0006),hl
 
-	; SASI読み書き処理をTPA末尾付近(0xc900)にコピーする
+	; SASI読み書き処理をTPA末尾付近(0xcf06)にコピーする
 	ld	hl,0x0100+PROGSZ	; COMが0x100に読まれるので、ここがLDSYSHDRDCの先頭になる
-	ld	de,0xc900
+	ld	de,LDSYS
 	ld	bc,endadr-LDSYS
 	ldir
 
@@ -113,7 +113,7 @@ registhddd:
 	sbc	hl,de
 	jr	nc,hdddcmd
 
-	ld	a,(0x000b)
+	ld	a,(0x0002)
 	ld	(BPB2DPB+2),a
 	ld	(b2dp1+2),a
 	ld	(b2dp2+2),a
@@ -152,16 +152,10 @@ hddcmd3ok:
 
 	; 指定ドライブのDPBアドレスを算出してdpbadrに入れる
 	sub	'A'
-	ld	l,a
-	ld	h,0
-	add	hl,hl		; 2
-	add	hl,hl		; 4
-	add	hl,hl		; 8
-	add	hl,hl		; 16
-	add	hl,hl		; 32
-	ld	bc,DPBTOP
-	add	hl,bc
-	ld	(dpbadr),hl
+	ld	e,a
+	ld	c,0x1f			;ディスク装置のパラメータの読み出し
+	call	0x0005
+	ld	(dpbadr),ix
 
 hddcmd1:
 	; 任意のドライブのDPBをHDDのもので上書き
@@ -397,7 +391,7 @@ hdisperr:
 
 ; 書き換え対象のDPBアドレス(デフォルトドライブ H:)
 dpbadr:
-	DW	0xede0
+	DW	0xf1e0
 
 ; エラーメッセージ群
 hdermsg:
@@ -472,11 +466,10 @@ HDLBA2		equ	$-hdddpb
 ;---------------------------------------------------------------------------
 ;SASI DRIVER
 ;---------------------------------------------------------------------------
-	org	TOP+PROGSZ,PROGSZ
+	org	LDSYS,PROGSZ
 
-; このアドレスが0x0006に書かれている。本来のシステムコールアドレスである0xcc06をここで呼ぶ(いいのかこれ)
-LDSYS:
-	JP	0xcc06		; このアドレスは常駐時にツブされる
+; このアドレスが0x0006に書かれている。本来のシステムコールアドレスである0xd106をここで呼ぶ(いいのかこれ)
+	JP	LDDEF		; このアドレスは常駐時にツブされる
 BPB2DPB:
 	JP	0
 
