@@ -409,7 +409,7 @@ hder4:
 	db	7,0x0d,0x0a,'HDD BPB read error$'
 
 hdrgmsg:
-	db	'LD HDD controller v0.08', 0x0d,0x0a, '$'
+	db	'LD HDD controller v0.09', 0x0d,0x0a, '$'
 targetdrv:
 	db	'H: $'
 
