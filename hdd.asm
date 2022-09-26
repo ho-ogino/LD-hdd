@@ -239,6 +239,10 @@ hddndsp:
 	call	check_bpb
 	jp	nc,0
 
+	ld	hl,0x0002		; DSK-0x00200から読む(MSX)
+	call	check_bpb
+	jp	nc,0
+
 	ld	hl,0x0100		; VHD-0x10000バイトから読む(BPB先頭。ただし先頭64KBが隠しセクタ固定(いいのかな))
 	call	check_bpb
 	jp	nc,0
