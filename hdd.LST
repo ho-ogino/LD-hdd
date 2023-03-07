@@ -13,7 +13,7 @@
                                 ; 0x100から読み込まれるCOMファイルとしてバイナリ出力する前提で作っています。
                                 ; 
                                 ; cf06からSASIドライブ読み書き処理が配置され、TPAの末尾(0x0006)をcf06に動かし、
-                                ; cf06にはJP 0xd206(元々0x0006に書かれていたアドレス(LSX-Dodgersのシステム領域開始アドレス)) を書く事で強引に常駐させています。
+                                ; cf06にはJP LDDEF(元々0x0006に書かれていたアドレス(LSX-Dodgersのシステム領域開始アドレス)) を書く事で強引に常駐させています。
                                 ; 正しい方法を知りたいところです……(リロケータブルにするのしんどいので固定にしてるのがダメ？)。
                                 ;
                                 ; 既存のDPB(ドライブパラメータブロック)をHDD用に上書きし、
@@ -66,44 +66,44 @@
                                 
                                 ;----------------------------------------------------------------------------
                                 ;
-       D006                     LDSYS       equ 0xd006          ; 常駐アドレスの頭
-       D206                     LDDEF       equ 0xd206          ; 既定のLDのアドレス
+       D106                     LDSYS       equ 0xd106          ; 常駐アドレスの頭
+       D306                     LDDEF       equ 0xd306          ; 既定のLDのアドレス
        0300                     PROGSZ      equ 0x300           ; 先頭(0x100)からの非常駐部のプログラムサイズ
                                 
                                 ;------------------------------------
 000000 0100                             org 0x0100
                                 ;----------------------------------------------------------------------------
        0100                     start:
-                                    ; 常駐チェック(手抜き。0x0006に0xd006が書かれていれば常駐済とする……)
+                                    ; 常駐チェック(手抜き。0x0006にLDDEFが書かれていれば常駐済とする……)
 000000 0100 2A0600          16      ld  hl,(0x0006)
 000003 0103 7D               4      ld  a,l
 000004 0104 FE06             7      cp  LDSYS & 0xff
 000006 0106 2008            12      jr  nz,registhddd
 000008 0108 7C               4      ld  a,h
-000009 0109 FED0             7      cp  LDSYS/256
+000009 0109 FED1             7      cp  LDSYS/256
 00000B 010B 2003            12      jr  nz,registhddd
 00000D 010D C35501          10      jp  hdddcmd
                                 
        0110                     registhddd:
-                                    ; 常駐チェック2(0x0006に0xd206が書かれていれば常駐する)
+                                    ; 常駐チェック2(0x0006にLDDEFが書かれていれば常駐する)
 000010 0110 7D               4      ld  a,l
 000011 0111 FE06             7      cp  LDDEF & 0xff
 000013 0113 C20000          10      jp  nz,0
 000016 0116 7C               4      ld  a,h
-000017 0117 FED2             7      cp  LDDEF/256
+000017 0117 FED3             7      cp  LDDEF/256
 000019 0119 C20000          10      jp  nz,0
                                 
-                                    ; TPA末尾を0xd006に動かす(不気味)
+                                    ; TPA末尾をLDDEFに動かす(不気味)
                                     ; まずは現状の値をコピー
-00001C 011C 2207D0          16      ld  (LDSYS+1),hl
+00001C 011C 2207D1          16      ld  (LDSYS+1),hl
                                 
-                                    ; 0x0006の中身を0xd006にする
-00001F 011F 2106D0          10      ld  hl,LDSYS
+                                    ; 0x0006の中身をLDDEFにする
+00001F 011F 2106D1          10      ld  hl,LDSYS
 000022 0122 220600          16      ld  (0x0006),hl
                                 
-                                    ; SASI読み書き処理をTPA末尾付近(0xd006)にコピーする
+                                    ; SASI読み書き処理をTPA末尾付近(LDDEF)にコピーする
 000025 0125 210004          10      ld  hl,0x0100+PROGSZ    ; COMが0x100に読まれるので、ここがLDSYSHDRDCの先頭になる
-000028 0128 1106D0          10      ld  de,LDSYS
+000028 0128 1106D1          10      ld  de,LDSYS
 00002B 012B 01E601          10      ld  bc,endadr-LDSYS
 00002E 012E EDB0                    ldir
                                 
@@ -115,12 +115,12 @@
 00003B 013B 3018            12      jr  nc,hdddcmd
                                 
 00003D 013D 3A0200          13      ld  a,(0x0002)
-000040 0140 320BD0          13      ld  (BPB2DPB+2),a
+000040 0140 320BD1          13      ld  (BPB2DPB+2),a
 000043 0143 324B01          13      ld  (b2dp1+2),a
 000046 0146 325401          13      ld  (b2dp2+2),a
 000049 0149 2AF2F0          16  b2dp1:  ld  hl,(_BPB2DPB+1)
-00004C 014C 220AD0          16      ld  (BPB2DPB+1),hl
-00004F 014F 2186D0          10      ld  hl,bpb2dpb1
+00004C 014C 220AD1          16      ld  (BPB2DPB+1),hl
+00004F 014F 2186D1          10      ld  hl,bpb2dpb1
 000052 0152 22F2F0          16  b2dp2:  ld  (_BPB2DPB+1),hl
                                     ; これで常駐完了
                                 
@@ -234,7 +234,7 @@
                                 ; BPBからDPBを設定する
                                 ; この時点でとりあえずSASIドライバの常駐はすんでいるので、直接ドライバの読み出し処理を使ってBPBを読み込む
 0000ED 01ED DD7E13          19      ld  a,(ix+DPB_UNITNO)
-0000F0 01F0 CDDBD0          17      call    sasi_set_drive
+0000F0 01F0 CDDBD1          17      call    sasi_set_drive
                                 
 0000F3 01F3 210000          10      ld  hl,0x0000       ; IMG-先頭から読む(BPB先頭)
 0000F6 01F6 CD3902          17      call    check_bpb
@@ -273,16 +273,16 @@
 00013A 023A 3E08             7      ld  a,08h           ;READ
 00013C 023C 1E00             7      ld  e,0
 00013E 023E 0E01             7      ld  c,1         ; C   = block size(BPBは1ブロック=256バイト以内に入る)
-000140 0240 CDF6D0          17      call    sasi_setup_rw6
-000143 0243 CD17D1          17      call    sasi_cmd6_open
+000140 0240 CDF6D1          17      call    sasi_setup_rw6
+000143 0243 CD17D2          17      call    sasi_cmd6_open
 000146 0246 3827            12      jr  c,bpbrerr
                                 ;SASIデータ転送
 000148 0248 210040          10      ld  hl,0x4000       ; テキトーに0x4000から読む(空いてるはず)
 00014B 024B 110001          10      ld  de,256          ; DE = trasnfer size
-00014E 024E CD76D0          17      call    sasi_transfer
+00014E 024E CD76D1          17      call    sasi_transfer
 000151 0251 381C            12      jr  c,bpbrerr
                                 ;SASIステータス、メッセージ、バスフリー
-000153 0253 CD56D1          17      call    sasi_close
+000153 0253 CD56D2          17      call    sasi_close
 000156 0256 3817            12      jr  c,bpbrerr
 000158 0258 E1              10      pop hl
                                 
@@ -422,9 +422,9 @@
             6572726F7224        
                                 
        0343                     hdrgmsg:
-000243 0343 4C44204844442063        db  'LD HDD controller v0.09', 0x0d,0x0a, '$'
+000243 0343 4C44204844442063        db  'LD HDD controller v0.10', 0x0d,0x0a, '$'
             6F6E74726F6C6C65    
-            722076302E30390D    
+            722076302E31300D    
             0A24                
        035D                     targetdrv:
 00025D 035D 483A2024                db  'H: $'
@@ -447,8 +447,8 @@
                                 ; HDD DPBのコピー元
        0361                     hdddpb:
 000261 0361 0800                    DW  FATSZ       ; +$00 FAT領域のセクタ単位でのサイズ(1byte)
-000263 0363 10D0                    DW  HDRDC       ; +$02 HLが書き込まれるメモリアドレス、DEが1を1kbとしたHDD読み込み位置？
-000265 0365 0CD0                    DW  HDWTC       ; +$04 HLが読み込みメモリアドレス、DEが1を1kbとしたHDD書き込み位置？
+000263 0363 10D1                    DW  HDRDC       ; +$02 HLが書き込まれるメモリアドレス、DEが1を1kbとしたHDD読み込み位置？
+000265 0365 0CD1                    DW  HDWTC       ; +$04 HLが読み込みメモリアドレス、DEが1を1kbとしたHDD書き込み位置？
 000267 0367 F8                      DB  $F8     ; +$06 メディアバイト(HDD)
 000268 0368 02                      DB  CSTSEC      ; +$07 1クラスタの論理セクタ数(1,2,4,8,16,32,64,128のみ可) 0x08
 000269 0369 0008                    DW  TOTALCST    ; +$08 総クラスタ数 0xefa
@@ -482,12 +482,12 @@
                                 ;---------------------------------------------------------------------------
                                 ;SASI DRIVER
                                 ;---------------------------------------------------------------------------
-000300 D006                         org LDSYS,PROGSZ
+000300 D106                         org LDSYS,PROGSZ
                                 
-                                ; このアドレスが0x0006に書かれている。本来のシステムコールアドレスである0xd206をここで呼ぶ(いいのかこれ)
-000300 D006 C306D2          10      JP  LDDEF       ; このアドレスは常駐時にツブされる
-       D009                     BPB2DPB:
-000303 D009 C30000          10      JP  0
+                                ; このアドレスが0x0006に書かれている。本来のシステムコールアドレスであるLDDEFをここで呼ぶ(いいのかこれ)
+000300 D106 C306D3          10      JP  LDDEF       ; このアドレスは常駐時にツブされる
+       D109                     BPB2DPB:
+000303 D109 C30000          10      JP  0
                                 
                                 ;---------------------------------------------------------------------------
                                 ;WRITE CLUSTER
@@ -500,9 +500,9 @@
                                 ;   C DE : next cluster
                                 ;   HL   : next address
                                 ;---------------------------------------------------------------------------
-       D00C                     HDWTC:
-000306 D00C 3E0A             7      ld  a,0Ah           ;WRITE(6)
-000308 D00E 1802            12      jr  HDRWC
+       D10C                     HDWTC:
+000306 D10C 3E0A             7      ld  a,0Ah           ;WRITE(6)
+000308 D10E 1802            12      jr  HDRWC
                                 ;   db  0x01            ;SKIP 2,BC ※BCをツブしてはいけなくなったのでjrしておく
                                 ;---------------------------------------------------------------------------
                                 ;READ CLUSTER
@@ -515,131 +515,131 @@
                                 ;   C DE : next cluster
                                 ;   HL   : next address
                                 ;---------------------------------------------------------------------------
-       D010                     HDRDC:
-00030A D010 3E08             7      ld  a,08h           ;READ(6)
-       D012                     HDRWC:
-00030C D012 C5              11      push bc
-00030D D013 D5              11      push de
-00030E D014 E5              11      push hl
-00030F D015 F5              11      push    af          ;SASI CMD
-000310 D016 DD7E13          19      ld  a,(ix+DPB_UNITNO)
-000313 D019 C5              11      push bc
-000314 D01A CDDBD0          17      call    sasi_set_drive
+       D110                     HDRDC:
+00030A D110 3E08             7      ld  a,08h           ;READ(6)
+       D112                     HDRWC:
+00030C D112 C5              11      push bc
+00030D D113 D5              11      push de
+00030E D114 E5              11      push hl
+00030F D115 F5              11      push    af          ;SASI CMD
+000310 D116 DD7E13          19      ld  a,(ix+DPB_UNITNO)
+000313 D119 C5              11      push bc
+000314 D11A CDDBD1          17      call    sasi_set_drive
                                 ; deの単位に合わせて256バイト単位のsasi_*secsをn(1,2,4)倍する
-000317 D01D EB               4      ex de,hl
-000318 D01E 79               4      ld  a,c
-000319 D01F DD4E0F          19      LD  c,(IX+00FH) ;DPB_0F_BPS(bit0-2:1:256バイト 2:512バイト 4:1024バイト)
-       D022                     mulsec1:
-00031C D022 CB19             8      rr  c
-00031E D024 3804            12      jr  c,mulsec2
-000320 D026 29              11      add hl,hl
-000321 D027 8F               4      adc a,a
-000322 D028 18F8            12      jr  mulsec1
-       D02A                     mulsec2:
-000324 D02A C1              10      pop bc
+000317 D11D EB               4      ex de,hl
+000318 D11E 79               4      ld  a,c
+000319 D11F DD4E0F          19      LD  c,(IX+00FH) ;DPB_0F_BPS(bit0-2:1:256バイト 2:512バイト 4:1024バイト)
+       D122                     mulsec1:
+00031C D122 CB19             8      rr  c
+00031E D124 3804            12      jr  c,mulsec2
+000320 D126 29              11      add hl,hl
+000321 D127 8F               4      adc a,a
+000322 D128 18F8            12      jr  mulsec1
+       D12A                     mulsec2:
+000324 D12A C1              10      pop bc
                                 ;パーティションオフセットを加算
-000325 D02B DD5E0C          19      ld  e,(ix+$0C)  ;LBA0/ フロッピーディスクのシリンダ数
-000328 D02E DD560D          19      ld  d,(ix+$0D)  ;LBA1/ フロッピーディスクの1トラックのセクタ数
-00032B D031 19              11      add hl,de
-00032C D032 DD8E18          19      adc a,(ix+$18)  ;LBA2/ フロッピーディスクのセクタの最小値
-00032F D035 384A            12      jr  c,sasi_err2
+000325 D12B DD5E0C          19      ld  e,(ix+$0C)  ;LBA0/ フロッピーディスクのシリンダ数
+000328 D12E DD560D          19      ld  d,(ix+$0D)  ;LBA1/ フロッピーディスクの1トラックのセクタ数
+00032B D131 19              11      add hl,de
+00032C D132 DD8E18          19      adc a,(ix+$18)  ;LBA2/ フロッピーディスクのセクタの最小値
+00032F D135 384A            12      jr  c,sasi_err2
                                 ;SASIコマンドを構築
-000331 D037 5F               4      ld  e,a     ;EHL = sasi LBA
-000332 D038 C620             7      add a,$100-$e0  ;SASIの理論アドレスは21ビットなので超えたらエラー
-000334 D03A 3845            12      jr  c,sasi_err2
-000336 D03C DD7E0F          19      ld  a,(ix+0x0f) ;DPB_0F_BPS(bit0-2:1:256バイト 2:512バイト 4:1024バイト)
-000339 D03F E607             7      and 7
-00033B D041 4F               4      ld  c,a     ;C   = block size
-00033C D042 AF               4      xor a
-       D043                     mulblock:
-00033D D043 81               4      add a,c
-00033E D044 10FD            13      djnz    mulblock
-000340 D046 4F               4      ld  c,a
-000341 D047 3257D0          13      ld  (tspat+2),a
-000344 D04A F1              10      pop af      ;SASI CMD
+000331 D137 5F               4      ld  e,a     ;EHL = sasi LBA
+000332 D138 C620             7      add a,$100-$e0  ;SASIの理論アドレスは21ビットなので超えたらエラー
+000334 D13A 3845            12      jr  c,sasi_err2
+000336 D13C DD7E0F          19      ld  a,(ix+0x0f) ;DPB_0F_BPS(bit0-2:1:256バイト 2:512バイト 4:1024バイト)
+000339 D13F E607             7      and 7
+00033B D141 4F               4      ld  c,a     ;C   = block size
+00033C D142 AF               4      xor a
+       D143                     mulblock:
+00033D D143 81               4      add a,c
+00033E D144 10FD            13      djnz    mulblock
+000340 D146 4F               4      ld  c,a
+000341 D147 3257D1          13      ld  (tspat+2),a
+000344 D14A F1              10      pop af      ;SASI CMD
                                 ;   call    sasi_setup_read6
                                 ;   call    sasi_setup_write6
-000345 D04B CDF6D0          17      call    sasi_setup_rw6  ;READ(08) OR write(08)
+000345 D14B CDF6D1          17      call    sasi_setup_rw6  ;READ(08) OR write(08)
                                 ;SASIセレクション、コマンドフェーズ
-000348 D04E CD17D1          17      call    sasi_cmd6_open
-00034B D051 382F            12      jr  c,sasi_err
+000348 D14E CD17D2          17      call    sasi_cmd6_open
+00034B D151 382F            12      jr  c,sasi_err
                                 ;SASIデータ転送
-00034D D053 E1              10      pop hl      ;HL = memory address
-00034E D054 E5              11      push hl
-00034F D055 110002          10  tspat:  ld  de,0x200    ;DE = trasnfer size
-000352 D058 CD76D0          17      call    sasi_transfer
-000355 D05B 3825            12      jr  c,sasi_err
+00034D D153 E1              10      pop hl      ;HL = memory address
+00034E D154 E5              11      push hl
+00034F D155 110002          10  tspat:  ld  de,0x200    ;DE = trasnfer size
+000352 D158 CD76D1          17      call    sasi_transfer
+000355 D15B 3825            12      jr  c,sasi_err
                                 ;SASIステータス、メッセージ、バスフリー
-000357 D05D CD56D1          17      call    sasi_close
-00035A D060 3820            12      jr  c,sasi_err
-00035C D062 E1              10      pop hl
-00035D D063 D1              10      pop de
-00035E D064 C1              10      pop bc
-00035F D065 3A57D0          13      ld  a,(tspat+2)
-000362 D068 84               4      add a,h     ;memory addressを進める
-000363 D069 67               4      ld  h,a
-000364 D06A 7B               4      ld  a,e     ;セクタ位置を進める
-000365 D06B 80               4      add a,b
-000366 D06C 5F               4      ld  e,a
-000367 D06D 7A               4      ld  a,d
-000368 D06E CE00             7      adc a,0
-00036A D070 57               4      ld  d,a
-00036B D071 89               4      adc a,c
-00036C D072 92               4      sub d
-00036D D073 4F               4      ld  c,a
-00036E D074 AF               4      xor a
-00036F D075 C9              10      ret
+000357 D15D CD56D2          17      call    sasi_close
+00035A D160 3820            12      jr  c,sasi_err
+00035C D162 E1              10      pop hl
+00035D D163 D1              10      pop de
+00035E D164 C1              10      pop bc
+00035F D165 3A57D1          13      ld  a,(tspat+2)
+000362 D168 84               4      add a,h     ;memory addressを進める
+000363 D169 67               4      ld  h,a
+000364 D16A 7B               4      ld  a,e     ;セクタ位置を進める
+000365 D16B 80               4      add a,b
+000366 D16C 5F               4      ld  e,a
+000367 D16D 7A               4      ld  a,d
+000368 D16E CE00             7      adc a,0
+00036A D170 57               4      ld  d,a
+00036B D171 89               4      adc a,c
+00036C D172 92               4      sub d
+00036D D173 4F               4      ld  c,a
+00036E D174 AF               4      xor a
+00036F D175 C9              10      ret
                                 ;---------------------------------------------------------------------------
-       D076                     sasi_transfer:
-000370 D076 3ACBD0          13      ld  a,(B_SASI_CMD6)
-000373 D079 FE08             7      cp  08h         ;READ(6)?
-000375 D07B CAC2D1          10      jp  z,sasi_rx       ;READ
-000378 D07E C398D1          10      jp  sasi_tx         ;WRITE
+       D176                     sasi_transfer:
+000370 D176 3ACBD1          13      ld  a,(B_SASI_CMD6)
+000373 D179 FE08             7      cp  08h         ;READ(6)?
+000375 D17B CAC2D2          10      jp  z,sasi_rx       ;READ
+000378 D17E C398D2          10      jp  sasi_tx         ;WRITE
                                 
                                 ;---------------------------------------------------------------------------
-       D081                     sasi_err2:
-00037B D081 F1              10      pop af
-       D082                     sasi_err:
-00037C D082 E1              10      pop hl
-00037D D083 D1              10      pop de
-00037E D084 C1              10      pop bc
+       D181                     sasi_err2:
+00037B D181 F1              10      pop af
+       D182                     sasi_err:
+00037C D182 E1              10      pop hl
+00037D D183 D1              10      pop de
+00037E D184 C1              10      pop bc
                                 ;   scf
-00037F D085 C9              10      ret
+00037F D185 C9              10      ret
                                 
                                 
-       D086                     bpb2dpb1:
-000380 D086 CD09D0          17      call    BPB2DPB
-000383 D089 D0              11      ret nc
-000384 D08A FD7E00          19      LD  A,(IY+0)    ;BS_JmpBoot
-000387 D08D FEEB             7      CP  0EBH        ;Short jump
-000389 D08F 2804            12      JR  Z,bpb2k
-00038B D091 FEE9             7      CP  0E9H        ;Near jump
-00038D D093 37               4      SCF
-00038E D094 C9              10      RET
-       D095                     bpb2k:              ;1セクタ2KB対策
-00038F D095 FD7E0C          19      LD  A,(IY+12)   ;BPB_BytsPerSec
-000392 D098 FE08             7      cp  8       ;1セクタ2KB
-000394 D09A 37               4      scf
-000395 D09B C0              11      ret nz
-000396 D09C DD7E0F          19      LD  A,(IX+00FH) ;DPB_0F_BPS
-000399 D09F EE0C             7      xor 0x0c
-00039B D0A1 DD770F          19      LD  (IX+00FH),A ;DPB_0F_BPS
+       D186                     bpb2dpb1:
+000380 D186 CD09D1          17      call    BPB2DPB
+000383 D189 D0              11      ret nc
+000384 D18A FD7E00          19      LD  A,(IY+0)    ;BS_JmpBoot
+000387 D18D FEEB             7      CP  0EBH        ;Short jump
+000389 D18F 2804            12      JR  Z,bpb2k
+00038B D191 FEE9             7      CP  0E9H        ;Near jump
+00038D D193 37               4      SCF
+00038E D194 C9              10      RET
+       D195                     bpb2k:              ;1セクタ2KB対策
+00038F D195 FD7E0C          19      LD  A,(IY+12)   ;BPB_BytsPerSec
+000392 D198 FE08             7      cp  8       ;1セクタ2KB
+000394 D19A 37               4      scf
+000395 D19B C0              11      ret nz
+000396 D19C DD7E0F          19      LD  A,(IX+00FH) ;DPB_0F_BPS
+000399 D19F EE0C             7      xor 0x0c
+00039B D1A1 DD770F          19      LD  (IX+00FH),A ;DPB_0F_BPS
                                 
-00039E D0A4 DDCB0726        23      sla (IX+7)      ;DPB_07_SECPCL
+00039E D1A4 DDCB0726        23      sla (IX+7)      ;DPB_07_SECPCL
                                 
-0003A2 D0A8 DDCB0026        23      sla (IX+0)      ;DPB_00_FATLN
-0003A6 D0AC DDCB0116        23      rl  (IX+1)      ;DPB_00_FATLN
+0003A2 D1A8 DDCB0026        23      sla (IX+0)      ;DPB_00_FATLN
+0003A6 D1AC DDCB0116        23      rl  (IX+1)      ;DPB_00_FATLN
                                 
-0003AA D0B0 DDCB0E26        23      sla (IX+00EH)   ;DPB_0E_FATPS
+0003AA D1B0 DDCB0E26        23      sla (IX+00EH)   ;DPB_0E_FATPS
                                 
-0003AE D0B4 DDCB1026        23      sla (IX+010H)   ;DPB_10_DIRPS
-0003B2 D0B8 DDCB1116        23      rl  (IX+011H)
+0003AE D1B4 DDCB1026        23      sla (IX+010H)   ;DPB_10_DIRPS
+0003B2 D1B8 DDCB1116        23      rl  (IX+011H)
                                 
-0003B6 D0BC DDCB0B26        23      sla (IX+00BH)   ;DPB_0B_DIRSCNT
+0003B6 D1BC DDCB0B26        23      sla (IX+00BH)   ;DPB_0B_DIRSCNT
                                 
-0003BA D0C0 DDCB1426        23      sla (IX+014H)   ;DPB_14_ADDCL16
-0003BE D0C4 DDCB1516        23      rl  (IX+015H)
-0003C2 D0C8 C9              10      ret
+0003BA D1C0 DDCB1426        23      sla (IX+014H)   ;DPB_14_ADDCL16
+0003BE D1C4 DDCB1516        23      rl  (IX+015H)
+0003C2 D1C8 C9              10      ret
                                 
                                 
                                 ;SASIドライバ本体
@@ -671,24 +671,24 @@
                                 ;----------------------------------------------------------------------------
                                 ;work area
                                 ;
-       D0C9                     B_SASI_ID:
-0003C3 D0C9 00                      db  00h     ;target ID byte
-       D0CA                     B_SASI_CMD_SIZE:
-0003C4 D0CA 06                      db  6       ;command length
+       D1C9                     B_SASI_ID:
+0003C3 D1C9 00                      db  00h     ;target ID byte
+       D1CA                     B_SASI_CMD_SIZE:
+0003C4 D1CA 06                      db  6       ;command length
                                 ;command data
-       D0CB                     B_SASI_CMD6:
-0003C5 D0CB 08                      db  08h     ;READ 08/WRITE 0A
-       D0CC                     B_SASI_CMD6_LUN_LAD2:
-0003C6 D0CC 00                      db  00h     ;LUN[2:0],LAD[20:16]
-       D0CD                     B_SASI_CMD6_LAD1:
-0003C7 D0CD 00                      db  00h     ;LAD[15: 8]
-       D0CE                     B_SASI_CMD6_LAD0:
-0003C8 D0CE 00                      db  00h     ;LAD[ 7: 0]
-       D0CF                     B_SASI_CMD6_NOB:
-0003C9 D0CF 00                      db  00h     ;number of blocks
-       D0D0                     B_SASI_CMD6_CTRL:
-0003CA D0D0 00                      db  00h     ;control
-0003CB D0D1 0000000000000000        db  0,0,0,0,0,0,0,0,0,0 ;max 16 bytes
+       D1CB                     B_SASI_CMD6:
+0003C5 D1CB 08                      db  08h     ;READ 08/WRITE 0A
+       D1CC                     B_SASI_CMD6_LUN_LAD2:
+0003C6 D1CC 00                      db  00h     ;LUN[2:0],LAD[20:16]
+       D1CD                     B_SASI_CMD6_LAD1:
+0003C7 D1CD 00                      db  00h     ;LAD[15: 8]
+       D1CE                     B_SASI_CMD6_LAD0:
+0003C8 D1CE 00                      db  00h     ;LAD[ 7: 0]
+       D1CF                     B_SASI_CMD6_NOB:
+0003C9 D1CF 00                      db  00h     ;number of blocks
+       D1D0                     B_SASI_CMD6_CTRL:
+0003CA D1D0 00                      db  00h     ;control
+0003CB D1D1 0000000000000000        db  0,0,0,0,0,0,0,0,0,0 ;max 16 bytes
             0000                
                                 
                                 ;----------------------------------------------------------------------------
@@ -696,56 +696,56 @@
                                 ;ドライブ番号(ID,LUN)の設定
                                 ;in
                                 ;    A : drive number (ID*2 +LUN)
-       D0DB                     sasi_set_drive:
-0003D5 D0DB 47               4      ld  b,a
-0003D6 D0DC AF               4      xor a           ;LUN=0
+       D1DB                     sasi_set_drive:
+0003D5 D1DB 47               4      ld  b,a
+0003D6 D1DC AF               4      xor a           ;LUN=0
                                 ;drive number -> LUB,SASI-ID
-0003D7 D0DD CB38             8      srl b
-0003D9 D0DF 3002            12      jr  nc,$+4
-0003DB D0E1 3E20             7      ld  a,0x20      ;LUN=1
-0003DD D0E3 32CCD0          13      ld  (B_SASI_CMD6_LUN_LAD2),a
-0003E0 D0E6 3E80             7      ld  a,0x80      ;SELECTION BITMASK
-0003E2 D0E8 04               4      inc b
-       D0E9                     SASI_id_l:
-0003E3 D0E9 07               4      rlca
-0003E4 D0EA 10FD            13      djnz    SASI_id_l
+0003D7 D1DD CB38             8      srl b
+0003D9 D1DF 3002            12      jr  nc,$+4
+0003DB D1E1 3E20             7      ld  a,0x20      ;LUN=1
+0003DD D1E3 32CCD1          13      ld  (B_SASI_CMD6_LUN_LAD2),a
+0003E0 D1E6 3E80             7      ld  a,0x80      ;SELECTION BITMASK
+0003E2 D1E8 04               4      inc b
+       D1E9                     SASI_id_l:
+0003E3 D1E9 07               4      rlca
+0003E4 D1EA 10FD            13      djnz    SASI_id_l
                                 ;SASI ID set
                                 ;   or  0x80        ;INITIATOR ID
-0003E6 D0EC 32C9D0          13      ld  (B_SASI_ID),a
-0003E9 D0EF C9              10      ret
+0003E6 D1EC 32C9D1          13      ld  (B_SASI_ID),a
+0003E9 D1EF C9              10      ret
                                 
                                 ;----------------------------------------------------------------------------
                                 ;setup SASI WRITE(6)
                                 ;in
                                 ;   EHL : LogicalBlockAddress (LBA[20:0])
                                 ;    C  : number of blocks
-       D0F0                     sasi_setup_write6:
-0003EA D0F0 3E0A             7      ld  a,0Ah           ;WRITE(6)
-0003EC D0F2 1802            12      jr  sasi_setup_rw6
+       D1F0                     sasi_setup_write6:
+0003EA D1F0 3E0A             7      ld  a,0Ah           ;WRITE(6)
+0003EC D1F2 1802            12      jr  sasi_setup_rw6
                                 ;----------------------------------------------------------------------------
                                 ;setup SASI READ(6)
                                 ;in
                                 ;   EHL : LogicalBlockAddress (LBA[20:0])
                                 ;    C  : number of blocks
-       D0F4                     sasi_setup_read6:
-0003EE D0F4 3E08             7      ld  a,08h           ;READ(6)
-       D0F6                     sasi_setup_rw6:
-0003F0 D0F6 32CBD0          13      ld  (B_SASI_CMD6),a
-0003F3 D0F9 0600             7      ld  b,0x00                  ;CTRL byte
-0003F5 D0FB ED43CFD0        20      ld  (B_SASI_CMD6_NOB),bc    ;NOB,CTRL
+       D1F4                     sasi_setup_read6:
+0003EE D1F4 3E08             7      ld  a,08h           ;READ(6)
+       D1F6                     sasi_setup_rw6:
+0003F0 D1F6 32CBD1          13      ld  (B_SASI_CMD6),a
+0003F3 D1F9 0600             7      ld  b,0x00                  ;CTRL byte
+0003F5 D1FB ED43CFD1        20      ld  (B_SASI_CMD6_NOB),bc    ;NOB,CTRL
                                 ;
-0003F9 D0FF 3ACCD0          13      ld  a,(B_SASI_CMD6_LUN_LAD2);LUN/LAD2
-0003FC D102 E6E0             7      and 0xe0
-0003FE D104 B3               4      or  e
-0003FF D105 32CCD0          13      ld  (B_SASI_CMD6_LUN_LAD2),a
-000402 D108 7D               4      ld  a,l                     ;swap
-000403 D109 6C               4      ld  l,h
-000404 D10A 67               4      ld  h,a
-000405 D10B 22CDD0          16      ld  (B_SASI_CMD6_LAD1),hl
+0003F9 D1FF 3ACCD1          13      ld  a,(B_SASI_CMD6_LUN_LAD2);LUN/LAD2
+0003FC D202 E6E0             7      and 0xe0
+0003FE D204 B3               4      or  e
+0003FF D205 32CCD1          13      ld  (B_SASI_CMD6_LUN_LAD2),a
+000402 D208 7D               4      ld  a,l                     ;swap
+000403 D209 6C               4      ld  l,h
+000404 D20A 67               4      ld  h,a
+000405 D20B 22CDD1          16      ld  (B_SASI_CMD6_LAD1),hl
                                 ;set command size
-000408 D10E 3E06             7      ld  a,6
-00040A D110 32CAD0          13      ld  (B_SASI_CMD_SIZE),a
-00040D D113 C9              10      ret
+000408 D20E 3E06             7      ld  a,6
+00040A D210 32CAD1          13      ld  (B_SASI_CMD_SIZE),a
+00040D D213 C9              10      ret
                                 
                                 ;----------------------------------------------------------------------------
                                 ;SASI OPEN BUS , send command
@@ -755,51 +755,51 @@
                                 ;out
                                 ;   CF : 1=timeout error
                                 ;   A  : SASI BUS status
-       D114                     sasi_cmd_n_open:
-00040E D114 32CAD0          13      ld  (B_SASI_CMD_SIZE),a
-       D117                     sasi_cmd6_open:
+       D214                     sasi_cmd_n_open:
+00040E D214 32CAD1          13      ld  (B_SASI_CMD_SIZE),a
+       D217                     sasi_cmd6_open:
                                 ;selection
-000411 D117 3AC9D0          13      ld  a,(B_SASI_ID)
-000414 D11A 01D30F          10      ld  bc,IO_SASI_SEL_ON
-000417 D11D ED79            12      out (c),a
+000411 D217 3AC9D1          13      ld  a,(B_SASI_ID)
+000414 D21A 01D30F          10      ld  bc,IO_SASI_SEL_ON
+000417 D21D ED79            12      out (c),a
                                 ;WAIT BUSY
-000419 D11F 110202          10      ld  de,IO_SASI_STS_BSY*0x0101
-00041C D122 0603             7      ld  b,3             ;タイムアウト短めに
-00041E D124 CD76D1          17      call    wait_sasi_3
-000421 D127 79               4      ld  a,c             ;BUS STS
-000422 D128 D8              11      ret c
+000419 D21F 110202          10      ld  de,IO_SASI_STS_BSY*0x0101
+00041C D222 0603             7      ld  b,3             ;タイムアウト短めに
+00041E D224 CD76D2          17      call    wait_sasi_3
+000421 D227 79               4      ld  a,c             ;BUS STS
+000422 D228 D8              11      ret c
                                 ;selection off
-000423 D129 3E0F             7      ld  a,high IO_SASI_SEL_OFF
-000425 D12B D3D1            11      out (low IO_SASI_SEL_OFF),a
+000423 D229 3E0F             7      ld  a,high IO_SASI_SEL_OFF
+000425 D22B D3D1            11      out (low IO_SASI_SEL_OFF),a
                                 ;0A : CMD 
                                 ;0B : CMD & REQ
-000427 D12D 160B             7      ld  d,IO_SASI_STS_CXD | IO_SASI_STS_BSY | IO_SASI_STS_REQ
-000429 D12F CD72D1          17      call    wait_sasi
-00042C D132 381D            12      jr  c,sasi_phase_error
+000427 D22D 160B             7      ld  d,IO_SASI_STS_CXD | IO_SASI_STS_BSY | IO_SASI_STS_REQ
+000429 D22F CD72D2          17      call    wait_sasi
+00042C D232 381D            12      jr  c,sasi_phase_error
                                 ;command tx
-00042E D134 21CBD0          10      ld  hl,B_SASI_CMD6
-000431 D137 3ACAD0          13      ld  a,(B_SASI_CMD_SIZE)
-000434 D13A 5F               4      ld  e,a
-000435 D13B 1600             7      ld  d,0
-000437 D13D CD98D1          17      call    sasi_tx
-00043A D140 380F            12      jr  c,sasi_phase_error
+00042E D234 21CBD1          10      ld  hl,B_SASI_CMD6
+000431 D237 3ACAD1          13      ld  a,(B_SASI_CMD_SIZE)
+000434 D23A 5F               4      ld  e,a
+000435 D23B 1600             7      ld  d,0
+000437 D23D CD98D2          17      call    sasi_tx
+00043A D240 380F            12      jr  c,sasi_phase_error
                                 ;07 : DATA_IN
                                 ;03 : DATA_OUT
                                 ;0F : STATUS
-00043C D142 110101          10      ld  de,IO_SASI_STS_REQ*0x0101
-00043F D145 CD74D1          17      call    wait_sasi_2 ;CF=tmeout error
-000442 D148 3807            12      jr  c,sasi_phase_error
+00043C D242 110101          10      ld  de,IO_SASI_STS_REQ*0x0101
+00043F D245 CD74D2          17      call    wait_sasi_2 ;CF=tmeout error
+000442 D248 3807            12      jr  c,sasi_phase_error
                                 ;data phase ok
-       D14A                     get_scsi_bus_status:
-000444 D14A 3E0F             7      ld  a,high IO_SASI_STS
-000446 D14C DBD1            11      in  a,(low IO_SASI_STS)
-000448 D14E E61F             7      and 1fh     ;CF=0
-00044A D150 C9              10      ret
+       D24A                     get_scsi_bus_status:
+000444 D24A 3E0F             7      ld  a,high IO_SASI_STS
+000446 D24C DBD1            11      in  a,(low IO_SASI_STS)
+000448 D24E E61F             7      and 1fh     ;CF=0
+00044A D250 C9              10      ret
                                 ;
-       D151                     sasi_phase_error:
-00044B D151 CD4AD1          17      call    get_scsi_bus_status
-00044E D154 37               4      scf
-00044F D155 C9              10      ret
+       D251                     sasi_phase_error:
+00044B D251 CD4AD2          17      call    get_scsi_bus_status
+00044E D254 37               4      scf
+00044F D255 C9              10      ret
                                 
                                 ;----------------------------------------------------------------------------
                                 ;sasi datain/dataout
@@ -813,19 +813,19 @@
                                 ;   L   : status byte
                                 ;   ZF  : 1= STS==MSG==0x00
                                 ;
-       D156                     sasi_close:
-000450 D156 160F             7      ld  d,0Fh           ;STATUS IN,REQ
-000452 D158 CD68D1          17      call    sasi_rx_phase_byte
-000455 D15B D8              11      ret c
-000456 D15C 6F               4      ld  l,a
-000457 D15D E5              11      push    hl
-000458 D15E 161F             7      ld  d,1Fh           ;MSG IN,REQ
-00045A D160 CD68D1          17      call    sasi_rx_phase_byte
-00045D D163 E1              10      pop hl
-00045E D164 D8              11      ret c
-00045F D165 67               4      ld  h,a
-000460 D166 B5               4      or  l
-000461 D167 C9              10      ret
+       D256                     sasi_close:
+000450 D256 160F             7      ld  d,0Fh           ;STATUS IN,REQ
+000452 D258 CD68D2          17      call    sasi_rx_phase_byte
+000455 D25B D8              11      ret c
+000456 D25C 6F               4      ld  l,a
+000457 D25D E5              11      push    hl
+000458 D25E 161F             7      ld  d,1Fh           ;MSG IN,REQ
+00045A D260 CD68D2          17      call    sasi_rx_phase_byte
+00045D D263 E1              10      pop hl
+00045E D264 D8              11      ret c
+00045F D265 67               4      ld  h,a
+000460 D266 B5               4      or  l
+000461 D267 C9              10      ret
                                 
                                 ;------------------------------------
                                 ;wait phase & receive byte
@@ -834,57 +834,57 @@
                                 ;out
                                 ;   CF  : 1=timeout
                                 ;   A   : SASI receive data
-       D168                     sasi_rx_phase_byte:
-000462 D168 CD72D1          17      call    wait_sasi
-000465 D16B D8              11      ret c
-000466 D16C 3E0F             7      ld  a,high IO_SASI_DATA
-000468 D16E DBD0            11      in  a,(low IO_SASI_DATA)
-00046A D170 B7               4      or  a       ;CF=0
-00046B D171 C9              10      ret
+       D268                     sasi_rx_phase_byte:
+000462 D268 CD72D2          17      call    wait_sasi
+000465 D26B D8              11      ret c
+000466 D26C 3E0F             7      ld  a,high IO_SASI_DATA
+000468 D26E DBD0            11      in  a,(low IO_SASI_DATA)
+00046A D270 B7               4      or  a       ;CF=0
+00046B D271 C9              10      ret
                                 
                                 ;----------------------------------------------------------------------------
                                 ;SASI 条件待ち合わせ
                                 ;in
                                 ;   D : STS match byte
-       D172                     wait_sasi:
-00046C D172 1E1F             7      ld  e,1fh       ;mask all bits
+       D272                     wait_sasi:
+00046C D272 1E1F             7      ld  e,1fh       ;mask all bits
                                 ;in
                                 ;   E : STS mask byte
-       D174                     wait_sasi_2:
+       D274                     wait_sasi_2:
                                 ;   ld  b,3     ;timeout count High
-00046E D174 060A             7      ld  b,10        ;timeout count High
+00046E D274 060A             7      ld  b,10        ;timeout count High
                                 ;in
                                 ;   B : timeout time
                                 ;out
                                 ;   C  : BUS STS
                                 ;   CF : 1=timeout error,(reset bus)
-       D176                     wait_sasi_3:
-000470 D176 210000          10      ld  hl,0        ;timeout count low
-       D179                     wait_sasi_l:
-000473 D179 3E0F             7      ld  a,high IO_SASI_STS
-000475 D17B DBD1            11      in  a,(low IO_SASI_STS)
-000477 D17D 4F               4      ld  c,a         ;save STS
-000478 D17E A3               4      and e           ;mask
-000479 D17F BA               4      cp  d           ;comapre
-00047A D180 C8              11      ret z           ;match
-00047B D181 2B               6      dec hl
-00047C D182 7C               4      ld  a,h
-00047D D183 B5               4      or  l
-00047E D184 20F3            12      jr  nz,wait_sasi_l
-000480 D186 10F1            13      djnz    wait_sasi_l
+       D276                     wait_sasi_3:
+000470 D276 210000          10      ld  hl,0        ;timeout count low
+       D279                     wait_sasi_l:
+000473 D279 3E0F             7      ld  a,high IO_SASI_STS
+000475 D27B DBD1            11      in  a,(low IO_SASI_STS)
+000477 D27D 4F               4      ld  c,a         ;save STS
+000478 D27E A3               4      and e           ;mask
+000479 D27F BA               4      cp  d           ;comapre
+00047A D280 C8              11      ret z           ;match
+00047B D281 2B               6      dec hl
+00047C D282 7C               4      ld  a,h
+00047D D283 B5               4      or  l
+00047E D284 20F3            12      jr  nz,wait_sasi_l
+000480 D286 10F1            13      djnz    wait_sasi_l
                                 ;   jr  sasi_reest
                                 
                                 ;----------------------------------------------------------------------------
                                 ;reset SASI BUS
-       D188                     sasi_reest:
-000482 D188 01D10F          10      ld  bc,IO_SASI_SEL_OFF
-000485 D18B ED79            12      out (c),a
-000487 D18D 01D20F          10      ld  bc,IO_SASI_RESET
-00048A D190 ED79            12      out (c),a
-00048C D192 0600             7      ld  b,0
-00048E D194 10FE            13      djnz    $
-000490 D196 37               4      scf
-000491 D197 C9              10      ret
+       D288                     sasi_reest:
+000482 D288 01D10F          10      ld  bc,IO_SASI_SEL_OFF
+000485 D28B ED79            12      out (c),a
+000487 D28D 01D20F          10      ld  bc,IO_SASI_RESET
+00048A D290 ED79            12      out (c),a
+00048C D292 0600             7      ld  b,0
+00048E D294 10FE            13      djnz    $
+000490 D296 37               4      scf
+000491 D297 C9              10      ret
 [EOF:sasi_poll.asm:SHIFT_JIS]
                                     include "sasi_poll_tx.asm"
                                 ;------------------------------------
@@ -894,41 +894,41 @@
                                 ;   DE : length
                                 ;out
                                 ;   CF : 1=timeout
-       D198                     sasi_tx:
+       D298                     sasi_tx:
                                 ;adjust 16bit to 2x8bit counter
-000492 D198 14               4      inc d
-000493 D199 1B               6      dec de
-000494 D19A 1C               4      inc e
-       D19B                     sasi_tx_req:
-000495 D19B 01D00F          10      ld  bc,IO_SASI_DATA
-       D19E                     sasi_tx_r:
-000498 D19E 78               4      ld  a,b
-000499 D19F DBD1            11      in  a,(low IO_SASI_STS)
-00049B D1A1 0F               4      rrca
-00049C D1A2 300D            12      jr  nc,sasi_tx_nreq
-00049E D1A4 04               4      inc b
-00049F D1A5 EDA3            16      outi
-0004A1 D1A7 1D               4      dec e
-0004A2 D1A8 C29ED1          10      jp  nz,sasi_tx_r
-0004A5 D1AB 15               4      dec d
-0004A6 D1AC C29ED1          10      jp  nz,sasi_tx_r
-0004A9 D1AF B7               4      or  a
-0004AA D1B0 C9              10      ret
+000492 D298 14               4      inc d
+000493 D299 1B               6      dec de
+000494 D29A 1C               4      inc e
+       D29B                     sasi_tx_req:
+000495 D29B 01D00F          10      ld  bc,IO_SASI_DATA
+       D29E                     sasi_tx_r:
+000498 D29E 78               4      ld  a,b
+000499 D29F DBD1            11      in  a,(low IO_SASI_STS)
+00049B D2A1 0F               4      rrca
+00049C D2A2 300D            12      jr  nc,sasi_tx_nreq
+00049E D2A4 04               4      inc b
+00049F D2A5 EDA3            16      outi
+0004A1 D2A7 1D               4      dec e
+0004A2 D2A8 C29ED2          10      jp  nz,sasi_tx_r
+0004A5 D2AB 15               4      dec d
+0004A6 D2AC C29ED2          10      jp  nz,sasi_tx_r
+0004A9 D2AF B7               4      or  a
+0004AA D2B0 C9              10      ret
                                 ;------------------
                                 ;wait until REQ
-       D1B1                     sasi_tx_nreq:
-0004AB D1B1 010000          10      ld  bc,0        ;reset timeout
-       D1B4                     sasi_tx_w:
-0004AE D1B4 3E0F             7      ld  a,high IO_SASI_STS
-0004B0 D1B6 DBD1            11      in  a,(low IO_SASI_STS)
-0004B2 D1B8 0F               4      rrca
-0004B3 D1B9 38E0            12      jr  c,sasi_tx_req
-0004B5 D1BB 10F7            13      djnz    sasi_tx_w
-0004B7 D1BD 0D               4      dec c
-0004B8 D1BE 20F4            12      jr  nz,sasi_tx_w
+       D2B1                     sasi_tx_nreq:
+0004AB D2B1 010000          10      ld  bc,0        ;reset timeout
+       D2B4                     sasi_tx_w:
+0004AE D2B4 3E0F             7      ld  a,high IO_SASI_STS
+0004B0 D2B6 DBD1            11      in  a,(low IO_SASI_STS)
+0004B2 D2B8 0F               4      rrca
+0004B3 D2B9 38E0            12      jr  c,sasi_tx_req
+0004B5 D2BB 10F7            13      djnz    sasi_tx_w
+0004B7 D2BD 0D               4      dec c
+0004B8 D2BE 20F4            12      jr  nz,sasi_tx_w
                                 ;timeout error
-0004BA D1C0 37               4      scf
-0004BB D1C1 C9              10      ret
+0004BA D2C0 37               4      scf
+0004BB D2C1 C9              10      ret
 [EOF:sasi_poll_tx.asm:SHIFT_JIS]
                                     include "sasi_poll_rx.asm"
                                 ;------------------------------------
@@ -938,44 +938,44 @@
                                 ;   DE : length
                                 ;out
                                 ;   CF : 1=timeout
-       D1C2                     sasi_rx:
+       D2C2                     sasi_rx:
                                 ;adjust 16bit counter : d=d+(e!=0)
-0004BC D1C2 14               4      inc d
-0004BD D1C3 1B               6      dec de
-0004BE D1C4 1C               4      inc e
-       D1C5                     sasi_rx_req:
-0004BF D1C5 01D00F          10      ld  bc,IO_SASI_DATA
-       D1C8                     sasi_rx_r:
-0004C2 D1C8 78               4      ld  a,b
-0004C3 D1C9 DBD1            11      in  a,(low IO_SASI_STS)
-0004C5 D1CB 0F               4      rrca
-0004C6 D1CC 300D            12      jr  nc,sasi_rx_nreq
-0004C8 D1CE EDA2            16      ini
-0004CA D1D0 04               4      inc b
-0004CB D1D1 1D               4      dec e
-0004CC D1D2 C2C8D1          10      jp  nz,sasi_rx_r
-0004CF D1D5 15               4      dec d
-0004D0 D1D6 C2C8D1          10      jp  nz,sasi_rx_r
-0004D3 D1D9 B7               4      or  a
-0004D4 D1DA C9              10      ret
+0004BC D2C2 14               4      inc d
+0004BD D2C3 1B               6      dec de
+0004BE D2C4 1C               4      inc e
+       D2C5                     sasi_rx_req:
+0004BF D2C5 01D00F          10      ld  bc,IO_SASI_DATA
+       D2C8                     sasi_rx_r:
+0004C2 D2C8 78               4      ld  a,b
+0004C3 D2C9 DBD1            11      in  a,(low IO_SASI_STS)
+0004C5 D2CB 0F               4      rrca
+0004C6 D2CC 300D            12      jr  nc,sasi_rx_nreq
+0004C8 D2CE EDA2            16      ini
+0004CA D2D0 04               4      inc b
+0004CB D2D1 1D               4      dec e
+0004CC D2D2 C2C8D2          10      jp  nz,sasi_rx_r
+0004CF D2D5 15               4      dec d
+0004D0 D2D6 C2C8D2          10      jp  nz,sasi_rx_r
+0004D3 D2D9 B7               4      or  a
+0004D4 D2DA C9              10      ret
                                 ;------------------
                                 ;wait until REQ
-       D1DB                     sasi_rx_nreq:
-0004D5 D1DB 010000          10      ld  bc,0        ;reset timeout
-       D1DE                     sasi_rx_w:
-0004D8 D1DE 3E0F             7      ld  a,high IO_SASI_STS
-0004DA D1E0 DBD1            11      in  a,(low IO_SASI_STS)
-0004DC D1E2 0F               4      rrca
-0004DD D1E3 38E0            12      jr  c,sasi_rx_req
-0004DF D1E5 10F7            13      djnz    sasi_rx_w
-0004E1 D1E7 0D               4      dec c
-0004E2 D1E8 20F4            12      jr  nz,sasi_rx_w
+       D2DB                     sasi_rx_nreq:
+0004D5 D2DB 010000          10      ld  bc,0        ;reset timeout
+       D2DE                     sasi_rx_w:
+0004D8 D2DE 3E0F             7      ld  a,high IO_SASI_STS
+0004DA D2E0 DBD1            11      in  a,(low IO_SASI_STS)
+0004DC D2E2 0F               4      rrca
+0004DD D2E3 38E0            12      jr  c,sasi_rx_req
+0004DF D2E5 10F7            13      djnz    sasi_rx_w
+0004E1 D2E7 0D               4      dec c
+0004E2 D2E8 20F4            12      jr  nz,sasi_rx_w
                                 ;timeout error
-0004E4 D1EA 37               4      scf
-0004E5 D1EB C9              10      ret
+0004E4 D2EA 37               4      scf
+0004E5 D2EB C9              10      ret
 [EOF:sasi_poll_rx.asm:SHIFT_JIS]
                                 
-       D1EC                     endadr:
+       D2EC                     endadr:
                                 
                                 ;---------------------------------------------------------------------------
 [EOF:hdd.ASM:SHIFT_JIS]
