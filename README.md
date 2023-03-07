@@ -5,7 +5,7 @@ LSX-Dodgers HDD Controller
 LD-hdd は、X1用のOS、LSX-DodgersにてHDDを扱うためのプログラムです。
 実HDDには対応しておらず、エミュレータ、または、BulePill基板を内蔵したSASIカードでの運用を想定しています。
 
-対象のLSX-Dodgers: 1.52(以降)
+対象のLSX-Dodgers: 1.58(以降)
 
 # 使い方
 ```
@@ -15,7 +15,7 @@ LD-hdd は、X1用のOS、LSX-DodgersにてHDDを扱うためのプログラム�
     target drive: A-H 割り当て先のドライブ(デフォルト H)。「:」は必要ないので注意。
 ```
 
-初回起動で 0xd006 から常駐します。アドレス固定なため、他の常駐プログラムを先に常駐させていると挙動がおかしくなるので、起動直後に実行してください。
+初回起動で 0xd106 から常駐します。アドレス固定なため、他の常駐プログラムを先に常駐させていると挙動がおかしくなるので、起動直後に実行してください。
 
 実行に成功すると、target driveで指定したドライブ(指定しない場合はH:ドライブ)がHDD用のドライブとして割り当てられます。
 
@@ -46,6 +46,8 @@ X1用のSASIドライバは [すーぱーたーぼ @SuperturboZ](https://twitter
 また、LSX-Dodgersの開発者である [Gaku](https://twitter.com/tablacus) さんにより、FAT16対応をはじめ、LSX-Dodgersの怒涛のバージョンアップがなされ、それに伴いLD-hddもあわせて更新いただいております。素晴らしいOSをありがとうございます。
 
 # History
+* Version 0.11 (2023/3/7)
+  * LSX-Dodgers 1.58に対応しました(1.57以前はVersion 0.10をお使いください)
 * Version 0.10 (2022/11/17)
   * LSX-Dodgers 1.52に対応しました
   * MSXのハードディスクに対応しました
