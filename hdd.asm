@@ -90,8 +90,54 @@ registhddd:
 	jp	nz,0
 	ld	a,h
 	cp	LDDEF/256
+	jr	z,registhddd1
+	cp	LDDEF/256+4
 	jp	nz,0
+	; セクタバッファが512バイトの場合、1024バイトに拡張する
+	ld	hl,(1)
+	ld	l,070h
+	inc	h
+	push	hl
+	pop	ix
+	ld	a,(ix+00bh)	;_F1024
+	cp	2
+	jp	z,0
 
+	ld	e,(ix+00ch)	;_FATBF
+	ld	d,(ix+00dh)
+
+	ld	l,(ix+00eh)	;_DTBUF
+	ld	h,(ix+00fh)
+
+	and	a
+	sbc	hl,de
+
+	ld	de,512*3
+	and	a
+	sbc	hl,de
+	jp	nz,0		;_FATBFが1.5kbかチェック
+
+	ld	hl,(0x0006)
+	ld	a,(hl)
+	jp	nz,0		;jp
+
+	di
+	ld	e,l
+	ld	d,h
+	dec	d
+	dec	d
+	dec	d
+	dec	d
+	ld	(0x0006),de
+	push	de
+	ld	bc,3
+	ldir
+	ld	(ix+00bh),2	;_F1024
+	ld	(ix+00eh),e	;_DTBUF
+	ld	(ix+00fh),d
+
+	pop	hl
+registhddd1:
 	; TPA末尾をLDDEFに動かす(不気味)
 	; まずは現状の値をコピー
 	ld	(LDSYS+1),hl
@@ -126,6 +172,11 @@ b2dp2:	ld	(_BPB2DPB+1),hl
 	; コマンドライン解析
 	; hdd [drive(0-3)] [block(2MB単位)] [target drive(A-G)]
 hdddcmd:
+	ld	e,7
+	ld	c,0x1f			;ディスク装置のパラメータの読み出し
+	call	0x0005
+	ld	(dpbadr),ix
+
 	; コマンドライン末尾の文字がA-Gの場合ドライブ名として扱い、対象のDPB位置を特定する
 	; A-Gではない場合はデフォルト H: で処理する
 	ld	hl,0x80
@@ -413,7 +464,7 @@ hder4:
 	db	7,0x0d,0x0a,'HDD BPB read error$'
 
 hdrgmsg:
-	db	'LD HDD controller v0.11', 0x0d,0x0a, '$'
+	db	'LD HDD controller v0.12', 0x0d,0x0a, '$'
 targetdrv:
 	db	'H: $'
 
