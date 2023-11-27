@@ -99,8 +99,8 @@ registhddd:
 	inc	h
 	push	hl
 	pop	ix
-	ld	a,(ix+00bh)	;_F1024
-	cp	2
+	ld	a,(ix+00bh)	;_MAX_SEC_SZ_H
+	cp	4
 	jp	z,0
 
 	ld	e,(ix+00ch)	;_FATBF
@@ -117,6 +117,9 @@ registhddd:
 	sbc	hl,de
 	jp	nz,0		;_FATBFが1.5kbかチェック
 
+	ld	c,0x5f 		;ディスクバッファのフラッシュ(_FLUSH)
+	call	0x0005
+
 	ld	hl,(0x0006)
 	ld	a,(hl)
 	jp	nz,0		;jp
@@ -132,7 +135,7 @@ registhddd:
 	push	de
 	ld	bc,3
 	ldir
-	ld	(ix+00bh),2	;_F1024
+	ld	(ix+00bh),4	;_MAX_SEC_SZ_H
 	ld	(ix+00eh),e	;_DTBUF
 	ld	(ix+00fh),d
 
@@ -261,12 +264,12 @@ hddcmd3:
 
 	ld	de,hdrgmsg
 	ld	c,0x09
-	call	0005h
+	call	0x0005
 
 	; ターゲットドライブを表示
 	ld	de,targetdrv
 	ld	c,0x09
-	call	0005h
+	call	0x0005
 
 	; 割り当てるHDD名を表示
 	ld	hl,(dpbadr)
@@ -440,7 +443,7 @@ hdisperr:
 	inc	hl
 	ld	d,(hl)
 	ld	c,0x09
-	call	0005h
+	call	0x0005
 	scf
 	jp	0
 
@@ -464,7 +467,7 @@ hder4:
 	db	7,0x0d,0x0a,'HDD BPB read error$'
 
 hdrgmsg:
-	db	'LD HDD controller v0.12', 0x0d,0x0a, '$'
+	db	'LD HDD controller v0.13', 0x0d,0x0a, '$'
 targetdrv:
 	db	'H: $'
 
