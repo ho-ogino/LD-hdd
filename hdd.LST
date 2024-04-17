@@ -179,7 +179,7 @@
 0000AA 01AA 1E07             7      ld  e,7
 0000AC 01AC 0E1F             7      ld  c,0x1f          ;ディスク装置のパラメータの読み出し
 0000AE 01AE CD0500          17      call    0x0005
-0000B1 01B1 DD224003        20      ld  (dpbadr),ix
+0000B1 01B1 DD225E03        20      ld  (dpbadr),ix
                                 
                                     ; コマンドライン末尾の文字がA-Gの場合ドライブ名として扱い、対象のDPB位置を特定する
                                     ; A-Gではない場合はデフォルト H: で処理する
@@ -199,32 +199,32 @@
                                 
                                     ; 2: Target drive error
 0000C9 01C9 0E02             7      ld  c,2
-0000CB 01CB C32C03          10      jp  hdisperr
+0000CB 01CB C34A03          10      jp  hdisperr
        01CE                     hddcmd3ok:
 0000CE 01CE E6DF             7      and 0xdf
                                     ; 表示用にドライブ名を入れておく
-0000D0 01D0 32BD03          13      ld  (targetdrv),a
+0000D0 01D0 32DB03          13      ld  (targetdrv),a
                                 
                                     ; 指定ドライブのDPBアドレスを算出してdpbadrに入れる
 0000D3 01D3 D641             7      sub 'A'
 0000D5 01D5 5F               4      ld  e,a
 0000D6 01D6 0E1F             7      ld  c,0x1f          ;ディスク装置のパラメータの読み出し
 0000D8 01D8 CD0500          17      call    0x0005
-0000DB 01DB DD224003        20      ld  (dpbadr),ix
+0000DB 01DB DD225E03        20      ld  (dpbadr),ix
                                 
        01DF                     hddcmd1:
                                     ; 任意のドライブのDPBをHDDのもので上書き
-0000DF 01DF 21C103          10      ld  hl,hdddpb       ; コピー元のHDD用DPB
-0000E2 01E2 ED5B4003        20      ld  de,(dpbadr)
+0000DF 01DF 21DF03          10      ld  hl,hdddpb       ; コピー元のHDD用DPB
+0000E2 01E2 ED5B5E03        20      ld  de,(dpbadr)
 0000E6 01E6 012000          10      ld  bc,32
 0000E9 01E9 EDB0                    ldir
                                 
 0000EB 01EB 115D00          10      ld  de,0x005d   ; arg1
-0000EE 01EE CD0D03          17      call    getnum
+0000EE 01EE CD2B03          17      call    getnum
 0000F1 01F1 3005            12      jr  nc,hddcmd2
                                     ; 0: Drive number error
 0000F3 01F3 0E00             7      ld  c,0
-0000F5 01F5 C32C03          10      jp  hdisperr
+0000F5 01F5 C34A03          10      jp  hdisperr
        01F8                     hddcmd2:
 0000F8 01F8 7D               4      ld  a,l
                                     ; 0-3 check
@@ -232,10 +232,10 @@
 0000FB 01FB 3805            12      jr  c,hddrvok
                                     ; 0: Drive number error
 0000FD 01FD 0E00             7      ld  c,0
-0000FF 01FF C32C03          10      jp  hdisperr
+0000FF 01FF C34A03          10      jp  hdisperr
        0202                     hddrvok:
                                     ; Set Unit Number( HDD DRIVE Number 0-3 )
-000102 0202 DD2A4003        20      ld  ix,(dpbadr)
+000102 0202 DD2A5E03        20      ld  ix,(dpbadr)
 000106 0206 DD7713          19      ld  (ix+0x13),a
                                 
 000109 0209 F5              11      push    af
@@ -244,12 +244,12 @@
 00010C 020C DD771F          19      ld  (ix+0x1f),a
                                 
 00010F 020F 116D00          10      ld  de,0x006d   ; arg2
-000112 0212 CD0D03          17      call    getnum
+000112 0212 CD2B03          17      call    getnum
 000115 0215 3006            12      jr  nc,hddcmd3
 000117 0217 F1              10      pop af
                                     ; 1: Offset number error
 000118 0218 0E01             7      ld  c,1
-00011A 021A C32C03          10      jp  hdisperr
+00011A 021A C34A03          10      jp  hdisperr
        021D                     hddcmd3:
 00011D 021D F1              10      pop af
                                 
@@ -263,17 +263,17 @@
 000124 0224 DD730D          19      ld  (ix+HDLBA1),e
 000127 0227 DD7218          19      ld  (ix+HDLBA2),d
                                 
-00012A 022A 11A303          10      ld  de,hdrgmsg
+00012A 022A 11C103          10      ld  de,hdrgmsg
 00012D 022D 0E09             7      ld  c,0x09
 00012F 022F CD0500          17      call    0x0005
                                 
                                     ; ターゲットドライブを表示
-000132 0232 11BD03          10      ld  de,targetdrv
+000132 0232 11DB03          10      ld  de,targetdrv
 000135 0235 0E09             7      ld  c,0x09
 000137 0237 CD0500          17      call    0x0005
                                 
                                     ; 割り当てるHDD名を表示
-00013A 023A 2A4003          16      ld  hl,(dpbadr)
+00013A 023A 2A5E03          16      ld  hl,(dpbadr)
 00013D 023D 011C00          10      ld  bc,0x1c
 000140 0240 09              11      add hl,bc
 000141 0241 0604             7      ld  b,4
@@ -291,134 +291,182 @@
 000150 0250 CDDBD1          17      call    sasi_set_drive
                                 
 000153 0253 210000          10      ld  hl,0x0000       ; IMG-先頭から読む(BPB先頭)
-000156 0256 CD9902          17      call    check_bpb
+000156 0256 CD9C02          17      call    check_bpb
 000159 0259 D20000          10      jp  nc,0
                                 
-00015C 025C 210200          10      ld  hl,0x0002       ; DSK-0x00200から読む(MSX)
-00015F 025F CD9902          17      call    check_bpb
-000162 0262 D20000          10      jp  nc,0
+00015C 025C 110041          10      ld  de,0x4100       ; MBRを読む
+00015F 025F 210100          10      ld  hl,0x0001
+000162 0262 CDF702          17      call    sasi_read
+000165 0265 D41503          17      call    nc,get_mbr_partition_1
+000168 0268 3807            12      jr  c,not_mbr
+00016A 026A 29              11      add hl,hl
+00016B 026B CD9C02          17      call    check_bpb
+00016E 026E D20000          10      jp  nc,0
+       0271                     not_mbr:
+000171 0271 210200          10      ld  hl,0x0002       ; DSK-0x00200から読む(MSX)
+000174 0274 CD9C02          17      call    check_bpb
+000177 0277 D20000          10      jp  nc,0
                                 
-000165 0265 210001          10      ld  hl,0x0100       ; VHD-0x10000バイトから読む(BPB先頭。ただし先頭64KBが隠しセクタ固定(いいのかな))
-000168 0268 CD9902          17      call    check_bpb
-00016B 026B D20000          10      jp  nc,0
+                                ;   ld  hl,0x0100       ; VHD-0x10000バイトから読む(BPB先頭。ただし先頭64KBが隠しセクタ固定(い;いのかな))
+                                ;   call    check_bpb
+                                ;   jp  nc,0
                                 
-00016E 026E 217E00          10      ld  hl,0x007e       ; IMG-0x07e00バイトから読む(MBR付き)
-000171 0271 CD9902          17      call    check_bpb
-000174 0274 D20000          10      jp  nc,0
+                                ;   ld  hl,0x007e       ; IMG-0x07e00バイトから読む(MBR付き)
+                                ;   call    check_bpb
+                                ;   jp  nc,0
                                 
-000177 0277 219800          10      ld  hl,0x0098       ; HDI-0x09800バイトから読む
-00017A 027A CD9902          17      call    check_bpb
-00017D 027D D20000          10      jp  nc,0
+00017A 027A 219800          10      ld  hl,0x0098       ; HDI-0x09800バイトから読む
+00017D 027D CD9C02          17      call    check_bpb
+000180 0280 D20000          10      jp  nc,0
                                 
-000180 0280 212001          10      ld  hl,0x0120       ; HDI-0x12000バイトから読む
-000183 0283 CD9902          17      call    check_bpb
-000186 0286 D20000          10      jp  nc,0
+000183 0283 212001          10      ld  hl,0x0120       ; HDI-0x12000バイトから読む
+000186 0286 CD9C02          17      call    check_bpb
+000189 0289 D20000          10      jp  nc,0
                                 
-000189 0289 210202          10      ld  hl,0x0202       ; NHD-0x20200バイトから読む
-00018C 028C CD9902          17      call    check_bpb
-00018F 028F D20000          10      jp  nc,0
+00018C 028C 210202          10      ld  hl,0x0202       ; NHD-0x20200バイトから読む
+00018F 028F CD9C02          17      call    check_bpb
+000192 0292 D20000          10      jp  nc,0
                                 
                                     ; BPBをオフにする
-000192 0292 DDCB12A6        23      res 4,(ix+$12)  ;DPB_01_DEVICE
-000196 0296 C30000          10      jp  0
+000195 0295 DDCB12A6        23      res 4,(ix+$12)  ;DPB_01_DEVICE
+000199 0299 C30000          10      jp  0
                                 
-       0299                     check_bpb:
-000199 0299 E5              11      push    hl
-00019A 029A 3E08             7      ld  a,08h           ;READ
-00019C 029C 1E00             7      ld  e,0
-00019E 029E 0E01             7      ld  c,1         ; C   = block size(BPBは1ブロック=256バイト以内に入る)
-0001A0 02A0 CDF6D1          17      call    sasi_setup_rw6
-0001A3 02A3 CD17D2          17      call    sasi_cmd6_open
-0001A6 02A6 3827            12      jr  c,bpbrerr
-                                ;SASIデータ転送
-0001A8 02A8 210040          10      ld  hl,0x4000       ; テキトーに0x4000から読む(空いてるはず)
-0001AB 02AB 110001          10      ld  de,256          ; DE = trasnfer size
-0001AE 02AE CD76D1          17      call    sasi_transfer
-0001B1 02B1 381C            12      jr  c,bpbrerr
-                                ;SASIステータス、メッセージ、バスフリー
-0001B3 02B3 CD56D2          17      call    sasi_close
-0001B6 02B6 3817            12      jr  c,bpbrerr
-0001B8 02B8 E1              10      pop hl
+       029C                     check_bpb:
+00019C 029C 110040          10      ld  de,0x4000       ; テキトーに0x4000から読む(空いてるはず)
+00019F 029F CDF702          17      call    sasi_read
+0001A2 02A2 3816            12      jr  c,bpbrerr
                                 
                                 ;   0x4000からBPBが読まれている(はず)
-       02B9                     bpbtodpb:
-0001B9 02B9 FD210040        14      ld  iy,$4000    ; BPB
+       02A4                     bpbtodpb:
+0001A4 02A4 FD210040        14      ld  iy,$4000    ; BPB
                                 
-0001BD 02BD FD7E00          19      ld  a,(iy+0)    ;BS_JmpBoot
-0001C0 02C0 FEEB             7      cp  $eb
-0001C2 02C2 2812            12      jr  z,bpbeb
-0001C4 02C4 FEE9             7      cp  $e9
-0001C6 02C6 2815            12      jr  z,bpbok
-0001C8 02C8 FE60             7      cp  $60     ;X68K
-0001CA 02CA 280A            12      jr  z,bpbeb
-       02CC                     notbpb:
-0001CC 02CC 37               4      scf
-0001CD 02CD 9F               4      sbc a,a
-0001CE 02CE C9              10      ret
+0001A8 02A8 FD7E00          19      ld  a,(iy+0)    ;BS_JmpBoot
+0001AB 02AB FEEB             7      cp  $eb
+0001AD 02AD 2811            12      jr  z,bpbeb
+0001AF 02AF FEE9             7      cp  $e9
+0001B1 02B1 2814            12      jr  z,bpbok
+0001B3 02B3 FE60             7      cp  $60     ;X68K
+0001B5 02B5 2809            12      jr  z,bpbeb
+       02B7                     notbpb:
+0001B7 02B7 37               4      scf
+0001B8 02B8 9F               4      sbc a,a
+0001B9 02B9 C9              10      ret
                                 
-       02CF                     bpbrerr:
-0001CF 02CF E1              10      pop hl
-0001D0 02D0 FB               4      ei
-0001D1 02D1 0E03             7      ld  c,3
-0001D3 02D3 C32C03          10      jp  hdisperr
+       02BA                     bpbrerr:
+0001BA 02BA FB               4      ei
+0001BB 02BB 0E03             7      ld  c,3
+0001BD 02BD C34A03          10      jp  hdisperr
                                 
-       02D6                     bpbeb:
-0001D6 02D6 FD7E02          19      ld  a,(iy+2)
-0001D9 02D9 FE90             7      cp  0x90
-0001DB 02DB 20EF            12      jr  nz,notbpb
-       02DD                     bpbok:
-0001DD 02DD FD7E0C          19      ld  a,(iy+12)   ;BPB_BytsPerSec
-0001E0 02E0 B7               4      or  a
-0001E1 02E1 28E9            12      jr  z,notbpb
-0001E3 02E3 47               4      ld  b,a
-0001E4 02E4 05               4      dec b
-0001E5 02E5 A0               4      and b
-0001E6 02E6 20E4            12      jr  nz,notbpb
+       02C0                     bpbeb:
+0001C0 02C0 FD7E02          19      ld  a,(iy+2)
+0001C3 02C3 FE90             7      cp  0x90
+0001C5 02C5 20F0            12      jr  nz,notbpb
+       02C7                     bpbok:
+0001C7 02C7 FD7E0C          19      ld  a,(iy+12)   ;BPB_BytsPerSec
+0001CA 02CA B7               4      or  a
+0001CB 02CB 28EA            12      jr  z,notbpb
+0001CD 02CD 47               4      ld  b,a
+0001CE 02CE 05               4      dec b
+0001CF 02CF A0               4      and b
+0001D0 02D0 20E5            12      jr  nz,notbpb
                                 
-0001E8 02E8 FD7E0D          19      ld  a,(iy+13)   ;BPB_SecPerClus
-0001EB 02EB B7               4      or  a
-0001EC 02EC 28DE            12      jr  z,notbpb
-0001EE 02EE 47               4      ld  b,a
-0001EF 02EF 05               4      dec b
-0001F0 02F0 A0               4      and b
-0001F1 02F1 20D9            12      jr  nz,notbpb
+0001D2 02D2 FD7E0D          19      ld  a,(iy+13)   ;BPB_SecPerClus
+0001D5 02D5 B7               4      or  a
+0001D6 02D6 28DF            12      jr  z,notbpb
+0001D8 02D8 47               4      ld  b,a
+0001D9 02D9 05               4      dec b
+0001DA 02DA A0               4      and b
+0001DB 02DB 20DA            12      jr  nz,notbpb
                                 
-0001F3 02F3 DDCB12EE        23      set 5,(ix+$12)  ;DPB_01_DEVICE
+0001DD 02DD DDCB12EE        23      set 5,(ix+$12)  ;DPB_01_DEVICE
                                     ; 隠しセクタぶんをLBAに足しておいてやる
-0001F7 02F7 DD5E0C          19      ld  e,(ix+HDLBA0)
-0001FA 02FA DD560D          19      ld  d,(ix+HDLBA1)
-0001FD 02FD AF               4      xor a
-0001FE 02FE 19              11      add hl,de
-0001FF 02FF DD8E18          19      adc a,(ix+HDLBA2)
-000202 0302 DD750C          19      ld  (ix+HDLBA0),l
-000205 0305 DD740D          19      ld  (ix+HDLBA1),h
-000208 0308 DD7718          19      ld  (ix+HDLBA2),a
-00020B 030B AF               4      xor a
-00020C 030C C9              10      ret
+0001E1 02E1 DD5E0C          19      ld  e,(ix+HDLBA0)
+0001E4 02E4 DD560D          19      ld  d,(ix+HDLBA1)
+0001E7 02E7 AF               4      xor a
+0001E8 02E8 19              11      add hl,de
+0001E9 02E9 DD8E18          19      adc a,(ix+HDLBA2)
+0001EC 02EC DD750C          19      ld  (ix+HDLBA0),l
+0001EF 02EF DD740D          19      ld  (ix+HDLBA1),h
+0001F2 02F2 DD7718          19      ld  (ix+HDLBA2),a
+0001F5 02F5 AF               4      xor a
+0001F6 02F6 C9              10      ret
                                 
-       030D                     getnum:
-00020D 030D 210000          10      ld  hl,0
-       0310                     numloop:
-000210 0310 1A               7      ld  a,(de)
-000211 0311 FE20             7      cp  0x20
-000213 0313 2816            12      jr  z,cmdend
+                                ;----------------------------------------------------------------------------
+                                ;sasiから1セクタ(256バイト読みだす)
+                                ;in
+                                ;       DE  : 読み出し先のセクタ番号
+                                ;       HL  : 読み出し先の先頭アドレス
+       02F7                     sasi_read:
+0001F7 02F7 E5              11      push    hl
+0001F8 02F8 D5              11      push    de
+0001F9 02F9 3E08             7      ld  a,08h           ;READ
+0001FB 02FB 1E00             7      ld  e,0
+0001FD 02FD 0E01             7      ld  c,1         ; C   = block size(BPBは1ブロック=256バイト以内に入る)
+0001FF 02FF CDF6D1          17      call    sasi_setup_rw6
+000202 0302 CD17D2          17      call    sasi_cmd6_open
+000205 0305 E1              10      pop hl
+000206 0306 380B            12      jr  c,sasi_read_e
+                                ;SASIデータ転送
+000208 0308 110001          10      ld  de,256          ; DE = trasnfer size
+00020B 030B CD76D1          17      call    sasi_transfer
+00020E 030E 3803            12      jr  c,sasi_read_e
+                                ;SASIステータス、メッセージ、バスフリー
+000210 0310 CD56D2          17      call    sasi_close
+       0313                     sasi_read_e:
+000213 0313 E1              10      pop hl
+000214 0314 C9              10      ret
+                                ;----------------------------------------------------------------------------
+                                ;MBRセクタから第一パーティションの開始LBAを取得する
+                                ;in
+                                ;       HL  : MBRセクタデータの先頭アドレス
+                                ;out
+                                ;       CF  : 1 = エラー (パーティーションテーブル不在)
+                                ;       HL: 第一パーティションの開始LBA (512バイト/セクタ)
+                                ;
+       01FE                     O_MBR_SIG   equ 0x01fe  ;MBRシグネチャのオフセット
+       01BE                     O_MBR_PTT_O equ 0x01be  ;第一パーティションのオフセット
+       0008                     O_PTT_LBA   equ 8       ;パーティションの開始LBA
+                                ;
+       0315                     get_mbr_partition_1:
+                                ;check MBR_sig
+000215 0315 2AFE41          16      ld  hl,(0x4000 + O_MBR_SIG)
+000218 0318 1155AA          10      ld  de,0xaa55
+00021B 031B B3               4      or  e
+00021C 031C ED52            15      sbc hl,de
+00021E 031E 2008            12      jr  nz,mbr_err
+                                ;parrion table #0 +8
+                                ;get start LBA
+000220 0320 2AC841          16      ld  hl,(0x4000 + O_MBR_PTT_O + O_PTT_LBA + 2)
+000223 0323 7C               4      ld  a,h
+000224 0324 B5               4      or  l
+000225 0325 2AC641          16      ld  hl,(0x4000 + O_MBR_PTT_O + O_PTT_LBA)
+       0328                     mbr_err:
+000228 0328 C6FF             7      add a,0xff
+00022A 032A C9              10      ret
+                                
+       032B                     getnum:
+00022B 032B 210000          10      ld  hl,0
+       032E                     numloop:
+00022E 032E 1A               7      ld  a,(de)
+00022F 032F FE20             7      cp  0x20
+000231 0331 2816            12      jr  z,cmdend
                                     
-000215 0315 D630             7      sub '0'
-000217 0317 3811            12      jr  c,cmderr
-000219 0319 FE0A             7      cp  10
-00021B 031B 300D            12      jr  nc,cmderr
+000233 0333 D630             7      sub '0'
+000235 0335 3811            12      jr  c,cmderr
+000237 0337 FE0A             7      cp  10
+000239 0339 300D            12      jr  nc,cmderr
                                 
                                 ;   hlを10倍にする(初回無駄だがまあいいや)
-00021D 031D 29              11      add hl,hl   ; x2
-00021E 031E E5              11      push hl
-00021F 031F 29              11      add hl,hl
-000220 0320 29              11      add hl,hl   ; x8
-000221 0321 C1              10      pop bc
-000222 0322 09              11      add hl,bc   ; x10
+00023B 033B 29              11      add hl,hl   ; x2
+00023C 033C E5              11      push hl
+00023D 033D 29              11      add hl,hl
+00023E 033E 29              11      add hl,hl   ; x8
+00023F 033F C1              10      pop bc
+000240 0340 09              11      add hl,bc   ; x10
                                 
-000223 0323 4F               4      ld c,a      ; hl + hl + a
-000224 0324 0600             7      ld b,0
-000226 0326 09              11      add hl,bc
+000241 0341 4F               4      ld c,a      ; hl + hl + a
+000242 0342 0600             7      ld b,0
+000244 0344 09              11      add hl,bc
                                 
                                 ;   add a,l     ; hl + hl + a   BCツブさない版？もっといい方法がありそう
                                 ;   ld  l,a
@@ -426,62 +474,62 @@
                                 ;   adc a,0
                                 ;   ld  h,a
                                 
-000227 0327 13               6      inc de
-000228 0328 18E6            12      jr numloop
+000245 0345 13               6      inc de
+000246 0346 18E6            12      jr numloop
                                 
-       032A                     cmderr:
-00022A 032A 37               4      scf
-       032B                     cmdend:
-00022B 032B C9              10      ret
+       0348                     cmderr:
+000248 0348 37               4      scf
+       0349                     cmdend:
+000249 0349 C9              10      ret
                                 
                                 ; b = error number
-       032C                     hdisperr:
-00022C 032C 0600             7      ld  b,0
-00022E 032E CB21             8      sla c   ; c = c * 2
-000230 0330 214203          10      ld  hl,hdermsg
-000233 0333 09              11      add hl,bc
-000234 0334 5E               7      ld  e,(hl)
-000235 0335 23               6      inc hl
-000236 0336 56               7      ld  d,(hl)
-000237 0337 0E09             7      ld  c,0x09
-000239 0339 CD0500          17      call    0x0005
-00023C 033C 37               4      scf
-00023D 033D C30000          10      jp  0
+       034A                     hdisperr:
+00024A 034A 0600             7      ld  b,0
+00024C 034C CB21             8      sla c   ; c = c * 2
+00024E 034E 216003          10      ld  hl,hdermsg
+000251 0351 09              11      add hl,bc
+000252 0352 5E               7      ld  e,(hl)
+000253 0353 23               6      inc hl
+000254 0354 56               7      ld  d,(hl)
+000255 0355 0E09             7      ld  c,0x09
+000257 0357 CD0500          17      call    0x0005
+00025A 035A 37               4      scf
+00025B 035B C30000          10      jp  0
                                 
                                 ; 書き換え対象のDPBアドレス(デフォルトドライブ H:)
-       0340                     dpbadr:
-000240 0340 E0F2                    DW  0xf2e0
+       035E                     dpbadr:
+00025E 035E E0F2                    DW  0xf2e0
                                 
                                 ; エラーメッセージ群
-       0342                     hdermsg:
-000242 0342 4A03                    DW  hder1
-000244 0344 6003                    DW  hder2
-000246 0346 7703                    DW  hder3
-000248 0348 8D03                    DW  hder4
-       034A                     hder1:
-00024A 034A 07496E76616C6964        db  7,'Invalid drive number$'
+       0360                     hdermsg:
+000260 0360 6803                    DW  hder1
+000262 0362 7E03                    DW  hder2
+000264 0364 9503                    DW  hder3
+000266 0366 AB03                    DW  hder4
+       0368                     hder1:
+000268 0368 07496E76616C6964        db  7,'Invalid drive number$'
             206472697665206E    
             756D62657224        
-       0360                     hder2:
-000260 0360 07496E76616C6964        db  7,'Invalid offset number$'
+       037E                     hder2:
+00027E 037E 07496E76616C6964        db  7,'Invalid offset number$'
             206F666673657420    
             6E756D62657224      
-       0377                     hder3:
-000277 0377 07496E76616C6964        db  7,'Invalid target drive$'
+       0395                     hder3:
+000295 0395 07496E76616C6964        db  7,'Invalid target drive$'
             2074617267657420    
             647269766524        
-       038D                     hder4:
-00028D 038D 070D0A4844442042        db  7,0x0d,0x0a,'HDD BPB read error$'
+       03AB                     hder4:
+0002AB 03AB 070D0A4844442042        db  7,0x0d,0x0a,'HDD BPB read error$'
             5042207265616420    
             6572726F7224        
                                 
-       03A3                     hdrgmsg:
-0002A3 03A3 4C44204844442063        db  'LD HDD controller v0.13', 0x0d,0x0a, '$'
+       03C1                     hdrgmsg:
+0002C1 03C1 4C44204844442063        db  'LD HDD controller v0.14', 0x0d,0x0a, '$'
             6F6E74726F6C6C65    
-            722076302E31330D    
+            722076302E31340D    
             0A24                
-       03BD                     targetdrv:
-0002BD 03BD 483A2024                db  'H: $'
+       03DB                     targetdrv:
+0002DB 03DB 483A2024                db  'H: $'
                                 
                                 
                                 ; ■VHD(15MB)のBPB情報(参考)
@@ -499,22 +547,22 @@
                                 ; BPB_TotSec32 ボリュームの総セクタ数: 0 ※BPB_TotSec16を見る事
                                 
                                 ; HDD DPBのコピー元
-       03C1                     hdddpb:
-0002C1 03C1 0800                    DW  FATSZ       ; +$00 FAT領域のセクタ単位でのサイズ(1byte)
-0002C3 03C3 10D1                    DW  HDRDC       ; +$02 HLが書き込まれるメモリアドレス、DEが1を1kbとしたHDD読み込み位置？
-0002C5 03C5 0CD1                    DW  HDWTC       ; +$04 HLが読み込みメモリアドレス、DEが1を1kbとしたHDD書き込み位置？
-0002C7 03C7 F8                      DB  $F8     ; +$06 メディアバイト(HDD)
-0002C8 03C8 02                      DB  CSTSEC      ; +$07 1クラスタの論理セクタ数(1,2,4,8,16,32,64,128のみ可) 0x08
-0002C9 03C9 0008                    DW  TOTALCST    ; +$08 総クラスタ数 0xefa
-0002CB 03CB 00                      DB  0       ; +$0A フロッピーディスクのモード(1byte)
-0002CC 03CC 0A                      DB  ROOTSCNT    ; +$0B ルートディレクトリ領域の終了の論理セクタ番号+1(1byte) 0x40
-       03CD                     HDDBL:
+       03DF                     hdddpb:
+0002DF 03DF 0800                    DW  FATSZ       ; +$00 FAT領域のセクタ単位でのサイズ(1byte)
+0002E1 03E1 10D1                    DW  HDRDC       ; +$02 HLが書き込まれるメモリアドレス、DEが1を1kbとしたHDD読み込み位置？
+0002E3 03E3 0CD1                    DW  HDWTC       ; +$04 HLが読み込みメモリアドレス、DEが1を1kbとしたHDD書き込み位置？
+0002E5 03E5 F8                      DB  $F8     ; +$06 メディアバイト(HDD)
+0002E6 03E6 02                      DB  CSTSEC      ; +$07 1クラスタの論理セクタ数(1,2,4,8,16,32,64,128のみ可) 0x08
+0002E7 03E7 0008                    DW  TOTALCST    ; +$08 総クラスタ数 0xefa
+0002E9 03E9 00                      DB  0       ; +$0A フロッピーディスクのモード(1byte)
+0002EA 03EA 0A                      DB  ROOTSCNT    ; +$0B ルートディレクトリ領域の終了の論理セクタ番号+1(1byte) 0x40
+       03EB                     HDDBL:
        000C                     HDLBA0      equ $-hdddpb
-0002CD 03CD 00                      DB  0       ; +$0C LBA0 / フロッピーディスクのシリンダ数(1byte)
+0002EB 03EB 00                      DB  0       ; +$0C LBA0 / フロッピーディスクのシリンダ数(1byte)
        000D                     HDLBA1      equ $-hdddpb
-0002CE 03CE 00                      DB  0       ; +$0D LBA1 / フロッピーディスクの1トラックのセクタ数(1byte) 隠しセクタ64KBをオフセットしてやる
-0002CF 03CF 02                      DB  FATHEAD     ; +$0E FAT領域の先頭論理セクタ番号(1byte) 0x08
-0002D0 03D0 02                      DB  LDRSVSEC    ; +$0F 予備FAT領域と論理セクタのサイズ 0x82
+0002EC 03EC 00                      DB  0       ; +$0D LBA1 / フロッピーディスクの1トラックのセクタ数(1byte) 隠しセクタ64KBをオフセットしてやる
+0002ED 03ED 02                      DB  FATHEAD     ; +$0E FAT領域の先頭論理セクタ番号(1byte) 0x08
+0002EE 03EE 02                      DB  LDRSVSEC    ; +$0F 予備FAT領域と論理セクタのサイズ 0x82
                                                 ;   上位1ビット:予備FAT領域
                                                 ;       1:使用する
                                                 ;       0:使用しない
@@ -522,16 +570,16 @@
                                                 ;       1:256バイト
                                                 ;       2:512バイト
                                                 ;       4:1024バイト
-0002D1 03D1 0A00                    DW  ROOTHEAD    ; +$10 ルートディレクトリ領域の先頭論理セクタ番号(1byte) 0x20
-0002D3 03D3 29                      DB  $29     ; +$12 Device Number?? ★
+0002EF 03EF 0A00                    DW  ROOTHEAD    ; +$10 ルートディレクトリ領域の先頭論理セクタ番号(1byte) 0x20
+0002F1 03F1 29                      DB  $29     ; +$12 Device Number?? ★
        0013                     DPB_UNITNO  equ $-hdddpb
-0002D4 03D4 03                  HDDDV:  DB  3       ; +$13 デバイスドライバ内におけるユニット番号(1byte)
-0002D5 03D5 1200                    DW  DATAHEAD    ; +$14 データ格納領域の先頭論理セクタ番号-2クラスタ(1byte) 0x30
-0002D7 03D7 0000                    DW  0       ; 
+0002F2 03F2 03                  HDDDV:  DB  3       ; +$13 デバイスドライバ内におけるユニット番号(1byte)
+0002F3 03F3 1200                    DW  DATAHEAD    ; +$14 データ格納領域の先頭論理セクタ番号-2クラスタ(1byte) 0x30
+0002F5 03F5 0000                    DW  0       ; 
        0018                     HDLBA2      equ $-hdddpb
-0002D9 03D9 0000                    DW  0       ; +$11 -> +$18 LBA2 / フロッピーディスクのセクタの最小値(1byte) ★LBA2として利用
-0002DB 03DB 0000                    DW  0       ; +$1A カレントディレクトリのクラスタ番号(2bytes)
-0002DD 03DD 48444430                DB  "HDD0"      ; +$1C
+0002F7 03F7 0000                    DW  0       ; +$11 -> +$18 LBA2 / フロッピーディスクのセクタの最小値(1byte) ★LBA2として利用
+0002F9 03F9 0000                    DW  0       ; +$1A カレントディレクトリのクラスタ番号(2bytes)
+0002FB 03FB 48444430                DB  "HDD0"      ; +$1C
                                 
                                 ;---------------------------------------------------------------------------
                                 ;SASI DRIVER

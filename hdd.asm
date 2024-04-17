@@ -293,17 +293,26 @@ hddndsp:
 	call	check_bpb
 	jp	nc,0
 
+	ld	de,0x4100		; MBRを読む
+	ld	hl,0x0001
+	call	sasi_read
+	call	nc,get_mbr_partition_1
+	jr	c,not_mbr
+	add	hl,hl
+	call	check_bpb
+	jp	nc,0
+not_mbr:
 	ld	hl,0x0002		; DSK-0x00200から読む(MSX)
 	call	check_bpb
 	jp	nc,0
 
-	ld	hl,0x0100		; VHD-0x10000バイトから読む(BPB先頭。ただし先頭64KBが隠しセクタ固定(いいのかな))
-	call	check_bpb
-	jp	nc,0
+;	ld	hl,0x0100		; VHD-0x10000バイトから読む(BPB先頭。ただし先頭64KBが隠しセクタ固定(い;いのかな))
+;	call	check_bpb
+;	jp	nc,0
 
-	ld	hl,0x007e		; IMG-0x07e00バイトから読む(MBR付き)
-	call	check_bpb
-	jp	nc,0
+;	ld	hl,0x007e		; IMG-0x07e00バイトから読む(MBR付き)
+;	call	check_bpb
+;	jp	nc,0
 
 	ld	hl,0x0098		; HDI-0x09800バイトから読む
 	call	check_bpb
@@ -322,22 +331,9 @@ hddndsp:
 	jp	0
 
 check_bpb:
-	push	hl
-	ld	a,08h			;READ
-	ld	e,0
-	ld	c,1			; C   = block size(BPBは1ブロック=256バイト以内に入る)
-	call	sasi_setup_rw6
-	call	sasi_cmd6_open
+	ld	de,0x4000		; テキトーに0x4000から読む(空いてるはず)
+	call	sasi_read
 	jr	c,bpbrerr
-;SASIデータ転送
-	ld	hl,0x4000		; テキトーに0x4000から読む(空いてるはず)
-	ld	de,256			; DE = trasnfer size
-	call	sasi_transfer
-	jr	c,bpbrerr
-;SASIステータス、メッセージ、バスフリー
-	call	sasi_close
-	jr	c,bpbrerr
-	pop	hl
 
 ;	0x4000からBPBが読まれている(はず)
 bpbtodpb:
@@ -356,7 +352,6 @@ notbpb:
 	ret
 
 bpbrerr:
-	pop	hl
 	ei
 	ld	c,3
 	jp	hdisperr
@@ -393,6 +388,59 @@ bpbok:
 	ld	(ix+HDLBA1),h
 	ld	(ix+HDLBA2),a
 	xor	a
+	ret
+
+;----------------------------------------------------------------------------
+;sasiから1セクタ(256バイト読みだす)
+;in
+;		DE	: 読み出し先のセクタ番号
+;		HL	: 読み出し先の先頭アドレス
+sasi_read:
+	push	hl
+	push	de
+	ld	a,08h			;READ
+	ld	e,0
+	ld	c,1			; C   = block size(BPBは1ブロック=256バイト以内に入る)
+	call	sasi_setup_rw6
+	call	sasi_cmd6_open
+	pop	hl
+	jr	c,sasi_read_e
+;SASIデータ転送
+	ld	de,256			; DE = trasnfer size
+	call	sasi_transfer
+	jr	c,sasi_read_e
+;SASIステータス、メッセージ、バスフリー
+	call	sasi_close
+sasi_read_e:
+	pop	hl
+	ret
+;----------------------------------------------------------------------------
+;MBRセクタから第一パーティションの開始LBAを取得する
+;in
+;		HL	: MBRセクタデータの先頭アドレス
+;out
+;		CF	: 1 = エラー (パーティーションテーブル不在)
+;		HL: 第一パーティションの開始LBA (512バイト/セクタ)
+;
+O_MBR_SIG	equ	0x01fe	;MBRシグネチャのオフセット
+O_MBR_PTT_O	equ	0x01be	;第一パーティションのオフセット
+O_PTT_LBA	equ	8		;パーティションの開始LBA
+;
+get_mbr_partition_1:
+;check MBR_sig
+	ld	hl,(0x4000 + O_MBR_SIG)
+	ld	de,0xaa55
+	or	e
+	sbc	hl,de
+	jr	nz,mbr_err
+;parrion table #0 +8
+;get start LBA
+	ld	hl,(0x4000 + O_MBR_PTT_O + O_PTT_LBA + 2)
+	ld	a,h
+	or	l
+	ld	hl,(0x4000 + O_MBR_PTT_O + O_PTT_LBA)
+mbr_err:
+	add	a,0xff
 	ret
 
 getnum:
@@ -467,7 +515,7 @@ hder4:
 	db	7,0x0d,0x0a,'HDD BPB read error$'
 
 hdrgmsg:
-	db	'LD HDD controller v0.13', 0x0d,0x0a, '$'
+	db	'LD HDD controller v0.14', 0x0d,0x0a, '$'
 targetdrv:
 	db	'H: $'
 
