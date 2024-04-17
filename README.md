@@ -46,6 +46,8 @@ X1用のSASIドライバは [すーぱーたーぼ @SuperturboZ](https://twitter
 また、LSX-Dodgersの開発者である [Gaku](https://twitter.com/tablacus) さんにより、FAT16対応をはじめ、LSX-Dodgersの怒涛のバージョンアップがなされ、それに伴いLD-hddもあわせて更新いただいております。素晴らしいOSをありがとうございます。
 
 # History
+* Version 0.14 (2024/4/17)
+  * MBR参照対応
 * Version 0.13 (2023/11/27)
   * 細かい修正
 * Version 0.12 (欠番)
