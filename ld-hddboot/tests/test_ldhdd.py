@@ -230,16 +230,43 @@ class TestMakesys(unittest.TestCase):
         com = read(HDD_COM)
         u0 = ldhdd.makesys(ld, com, 0)
         u1 = ldhdd.makesys(ld, com, 1)
-        self.assertEqual(len(u1), len(u0) + 5)
-        self.assertEqual(u1[97:105], bytes.fromhex("3e31325d00c30001"))
+        self.assertEqual(len(u1), len(u0) + 6)
+        # LD HL,2031H / LD (005DH),HL / JP 0100H
+        self.assertEqual(u1[97:106], bytes.fromhex("213120225d00c30001"))
         run0 = struct.unpack_from("<H", u0, 1)[0]
         run1 = struct.unpack_from("<H", u1, 1)[0]
-        self.assertEqual(run1, run0 - 5)
-        self.assertEqual(struct.unpack_from("<H", u1, 37)[0], run1 + 98)
-        self.assertEqual(u1[105:140], u0[100:135])
-        self.assertEqual(u1[116], 0x20)
+        self.assertEqual(run1, run0 - 6)
+        self.assertEqual(struct.unpack_from("<H", u1, 37)[0], run1 + 99)
+        self.assertEqual(u1[106:141], u0[100:135])
+        self.assertEqual(u1[117], 0x20)
+        # LD (005DH),HL で 005DH に '1'、005EH に空白が入る (HDD.COM の getnum は空白まで読む)
+        hl = struct.unpack_from("<H", u1, 98)[0]
+        self.assertEqual((hl & 0xFF, hl >> 8), (ord("1"), 0x20))
+        self.assertEqual(struct.unpack_from("<H", u1, 101)[0], 0x005D)
         self.assertEqual(u0[111], 0x20)
-        self.assertEqual(u1[140:], u0[135:])
+        self.assertEqual(u1[141:], u0[135:])
+
+    def test_legacy_unit_payload(self):
+        # 以前の版の --unit (005EH を書かない形) も見分け、info で知らせ、update で置き換えられる
+        com = read(HDD_COM)
+        ld = fake_ld_bin(top=0xD100, body_len=9721)
+        old = ldhdd.assemble_sys(ld, com, 1, legacy=True)
+        self.assertEqual(old[97:105], bytes.fromhex("3e31325d00c30001"))
+        si = ldhdd.parse_sys(old)
+        self.assertEqual((si.unit_override, si.legacy_unit), (1, True))
+        self.assertEqual(ldhdd.parse_sys(ldhdd.makesys(ld, com, 1)).legacy_unit, False)
+        with tempfile.TemporaryDirectory() as td:
+            v = make_vhd(os.path.join(td, "t.vhd"))
+            with open(v, "r+b") as f:
+                mbr = f.read(512)
+                f.seek(0)
+                f.write(ldhdd.boot_record(mbr, old) + old)
+            run_main(["info", v])
+            self.assertIn("以前の版の誤り", run_main.out)
+            ldhdd.update(v, inputs_from(ld, com), unit=1, backup=False, out=io.StringIO())
+            run_main(["info", v])
+            self.assertIn("スタブで 1 を指定", run_main.out)
+            self.assertNotIn("以前の版の誤り", run_main.out)
 
     def test_unit_out_of_range(self):
         with self.assertRaises(ldhdd.LdhddError):
