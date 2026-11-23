@@ -756,6 +756,30 @@ class TestUpdate(unittest.TestCase):
         self.assertEqual(sorted(os.listdir(self.dir)), sorted(["t.vhd", os.path.basename(bak)]))
 
     @unittest.skipIf(os.name == "nt", "ハードリンクのテスト")
+    def test_fallback_name_taken_during_publish(self):
+        # ハードリンクが使えない時も、名前を付ける直前にできた同じ名前の物は置き換えない
+        import errno as _errno
+        v = self.vhd()
+        before = sha(v)
+        orig_link = ldhdd.os.link
+        taken = []
+
+        def nolink(a, b, **kw):
+            with open(b, "wb") as f:  # 名前を付ける直前に、ほかの誰かが同じ名前を作る
+                f.write(b"other")
+            taken.append(b)
+            raise OSError(_errno.EPERM, "Operation not permitted")
+        ldhdd.os.link = nolink
+        try:
+            with self.assertRaisesRegex(ldhdd.LdhddError, "バックアップを作れません"):
+                self.quiet_update(v)
+        finally:
+            ldhdd.os.link = orig_link
+        self.assertEqual(sha(v), before)
+        self.assertEqual(read(taken[0]), b"other")
+        self.assertEqual(sorted(os.listdir(self.dir)), sorted(["t.vhd", os.path.basename(taken[0])]))
+
+    @unittest.skipIf(os.name == "nt", "ハードリンクのテスト")
     def test_backup_name_taken_during_publish(self):
         v = self.vhd()
         before = sha(v)
@@ -855,6 +879,32 @@ class TestUpdate(unittest.TestCase):
                 self.after_move(dst)
             return 1
 
+    def test_windows_branch_through_update(self):
+        # Windows の名前付け (MoveFileExW の偽物) を通して update する: 中身・名前のぶつかり・仮ファイルの後始末
+        k = self.FakeKernel32()
+        v = self.vhd()
+        base = read(v)
+        orig = (ldhdd._IS_WINDOWS, ldhdd._windows_move_no_replace)
+        ldhdd._IS_WINDOWS = True
+        ldhdd._windows_move_no_replace = lambda s_, d_: orig[1](s_, d_, kernel32=k)
+        try:
+            bak = self.quiet_update(v)
+            self.assertEqual(read(bak), base)
+            self.assertEqual(k.calls, [0x8])
+            orig_path = ldhdd._backup_path
+            ldhdd._backup_path = lambda path: bak
+            try:
+                before = sha(v)
+                with self.assertRaisesRegex(ldhdd.LdhddError, "バックアップを作れません"):
+                    self.quiet_update(v)
+                self.assertEqual(sha(v), before)
+            finally:
+                ldhdd._backup_path = orig_path
+        finally:
+            ldhdd._IS_WINDOWS, ldhdd._windows_move_no_replace = orig
+        self.assertEqual(read(bak), base)
+        self.assertEqual(sorted(os.listdir(self.dir)), sorted(["t.vhd", os.path.basename(bak)]))
+
     def test_windows_backup_move(self):
         # Windows の名前付けは MoveFileExW(MOVEFILE_WRITE_THROUGH = 0x8 のみ。REPLACE_EXISTING = 0x1 は付けない)
         k = self.FakeKernel32()
@@ -880,7 +930,21 @@ class TestUpdate(unittest.TestCase):
         make_vhd(os.path.join(a, "t.vhd"))
         os.symlink(os.path.join(a, "b"), os.path.join(self.dir, "lnk"))
         v = os.path.join(self.dir, "lnk", "..", "t.vhd")
-        bak = self.quiet_update(v)
+        created = []
+        orig_open = ldhdd.os.open
+
+        def rec_open(p, flags, *a, **kw):
+            if str(p).endswith(".part"):
+                created.append(p)
+            return orig_open(p, flags, *a, **kw)
+        ldhdd.os.open = rec_open
+        try:
+            bak = self.quiet_update(v)
+        finally:
+            ldhdd.os.open = orig_open
+        # 仮ファイルもバックアップと同じディレクトリ (a/) に作られたこと
+        self.assertEqual(len(created), 1)
+        self.assertTrue(os.path.samefile(os.path.dirname(created[0]), a))
         self.assertTrue(os.path.samefile(os.path.dirname(bak), a))
         self.assertEqual([x for x in os.listdir(a) if x.endswith(".bak")], [os.path.basename(bak)])
         self.assertEqual([x for x in os.listdir(self.dir) if x.endswith(".bak")], [])

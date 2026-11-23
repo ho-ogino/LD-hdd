@@ -27,7 +27,6 @@ import re
 import shutil
 import struct
 import sys
-import tempfile
 from typing import Dict, List, NamedTuple, Optional, Tuple
 
 __version__ = "1.0.0"
@@ -761,7 +760,7 @@ def make_backup(f, path: str) -> str:
     leftover = None
     f.seek(0)
     try:
-        fd, tmp = tempfile.mkstemp(prefix=".ldhdd-", suffix=".part", dir=d)
+        fd, tmp = _create_staging(d)
         try:
             _copy_to_fd(f, fd)
         finally:
@@ -796,6 +795,20 @@ def _backup_dir(dst: str) -> str:
     return os.path.dirname(dst) or os.curdir
 
 
+_IS_WINDOWS = os.name == "nt"
+
+
+def _create_staging(d: str) -> Tuple[int, str]:
+    """d に仮ファイルを作る。tempfile.mkstemp は d を abspath でたたむので使わない"""
+    for _ in range(100):
+        tmp = os.path.join(d, ".ldhdd-%d-%s.part" % (os.getpid(), os.urandom(4).hex()))
+        try:
+            return os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o600), tmp
+        except FileExistsError:
+            continue
+    raise OSError(errno.EEXIST, "仮ファイルの名前を決められません")
+
+
 def _copy_to_fd(f, fd: int) -> None:
     """f の中身を fd に写して同期する。fd は閉じない"""
     with os.fdopen(fd, "wb", closefd=False) as out:
@@ -806,7 +819,7 @@ def _copy_to_fd(f, fd: int) -> None:
 
 def _fsync_dir(path: str) -> None:
     """ディレクトリの項目をディスクに書く (POSIX のみ。Windows は名前付けを書き切りで行うので何もしない)"""
-    if os.name == "nt":
+    if _IS_WINDOWS:
         return
     fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
     try:
@@ -818,7 +831,7 @@ def _fsync_dir(path: str) -> None:
 def _publish_no_replace(tmp: str, dst: str) -> Optional[str]:
     """tmp を dst という名前にする。dst が既にあれば失敗する (置き換えない)。
     正式な名前を付けた後に仮の名前を消せなかった時は、その仮の名前を返す (失敗にはしない)。"""
-    if os.name == "nt":
+    if _IS_WINDOWS:
         _windows_move_no_replace(tmp, dst)
         return None
     try:
@@ -826,10 +839,17 @@ def _publish_no_replace(tmp: str, dst: str) -> Optional[str]:
     except OSError as e:
         if e.errno not in (errno.EPERM, errno.EOPNOTSUPP, errno.ENOTSUP, errno.EMLINK):
             raise
-        # ハードリンクが使えないファイルシステム (FAT など): 名前が無いことを確かめてから rename
-        if os.path.lexists(dst):
-            raise OSError(errno.EEXIST, "バックアップの名前 %s が既にあります" % dst)
-        os.rename(tmp, dst)
+        # ハードリンクが使えないファイルシステム (FAT など): 先に正式な名前を O_EXCL で押さえ
+        # (既にあれば失敗する)、押さえた自分の空ファイルを仮ファイルで置き換える
+        os.close(os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
+        try:
+            os.rename(tmp, dst)
+        except OSError:
+            try:
+                os.remove(dst)
+            except OSError:
+                pass
+            raise
         return None
     try:
         os.remove(tmp)
