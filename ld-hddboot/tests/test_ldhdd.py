@@ -14,6 +14,7 @@ import shutil
 import struct
 import sys
 import tempfile
+import time
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -1614,6 +1615,390 @@ class TestNew(unittest.TestCase):
         self.assertEqual(run_main(["new", path, "--size", "2M", "--ldsys", MKLDHD, "--ld-bin", p_ld]), 1)
         self.assertIn("既にあります", run_main.err)
         self.assertEqual(sha(path), before)
+
+
+def vol_read_file(vol, path):
+    parts = [p for p in path.split("/") if p]
+    cl = vol.resolve_dir("/".join(parts[:-1]))
+    e = vol.find(vol.read_dir(cl), ldhdd.to_short_name(parts[-1]))
+    assert e is not None and not e.is_dir, path
+    if e.cluster == 0:
+        return b""
+    data = b"".join(ldhdd._read_at(vol.f, vol.cluster_off(c), vol.csize) for c in vol.chain(e.cluster, path))
+    return data[:e.size]
+
+
+class TestShortName(unittest.TestCase):
+    def test_names(self):
+        self.assertEqual(ldhdd.to_short_name("README.TXT"), b"README  TXT")
+        self.assertEqual(ldhdd.to_short_name("readme.txt"), b"README  TXT")
+        self.assertEqual(ldhdd.to_short_name("A"), b"A          ")
+        self.assertEqual(ldhdd.to_short_name("ABCDEFGH.ABC"), b"ABCDEFGHABC")
+        for bad in ("ABCDEFGHI.TXT", "A.ABCD", "A.B.C", ".PROFILE", "A B.TXT", "A*B", "日本語.TXT", "", "A."):
+            with self.assertRaises(ldhdd.LdhddError, msg=bad):
+                ldhdd.to_short_name(bad)
+
+
+class TestAdd(unittest.TestCase):
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+        self.dir = self.td.name
+        self.com = read(HDD_COM)
+        self.ld = ldhdd.files_from_d88(MKLDHD)["LD.BIN"][135 + len(self.com):]
+        self.src = os.path.join(self.dir, "src")
+        os.mkdir(self.src)
+
+    def tearDown(self):
+        self.td.cleanup()
+
+    def vhd(self, size="15M", name="t.vhd"):
+        path = os.path.join(self.dir, name)
+        ldhdd.new_image(path, ldhdd.parse_size(size), inputs_from(self.ld, self.com), [], out=io.StringIO())
+        return path
+
+    def put(self, rel, data=b"x"):
+        p = os.path.join(self.src, rel)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "wb") as f:
+            f.write(data)
+        return p
+
+    def add(self, path, sources, **kw):
+        kw.setdefault("backup", False)
+        return ldhdd.add(path, sources, out=io.StringIO(), **kw)
+
+    def open_vol(self, path):
+        f = ldhdd._open_target(path, False)
+        return f, ldhdd.FatVolume(f)
+
+    def assert_refused(self, path, sources, regex, **kw):
+        before = sha(path)
+        with self.assertRaisesRegex(ldhdd.LdhddError, regex):
+            self.add(path, sources, **kw)
+        self.assertEqual(sha(path), before)
+
+    def test_files_and_tree_fat12_fat16(self):
+        for size in ("15M", "128M"):
+            path = self.vhd(size, "t%s.vhd" % size)
+            f, vol = self.open_vol(path)
+            cs = vol.csize
+            f.close()
+            files = {"E0.BIN": b"", "E1.BIN": b"\x01", "C1.BIN": b"\x02" * cs, "C2.BIN": b"\x03" * (cs + 1),
+                     "MANY.BIN": os.urandom(cs * 3 + 17)}
+            top = os.path.join(self.src, "T" + size[:-1])
+            for n, d in files.items():
+                self.put(os.path.join("T" + size[:-1], n), d)
+            self.put(os.path.join("T" + size[:-1], "A", "B", "C", "DEEP.TXT"), b"deep")
+            self.add(path, [top])
+            f, vol = self.open_vol(path)
+            try:
+                for n, d in files.items():
+                    self.assertEqual(vol_read_file(vol, "/T%s/%s" % (size[:-1], n)), d, (size, n))
+                self.assertEqual(vol_read_file(vol, "/T%s/A/B/C/DEEP.TXT" % size[:-1]), b"deep")
+                # . と .. の項目
+                a = vol.find(vol.read_dir(vol.resolve_dir("/T" + size[:-1])), ldhdd.to_short_name("A"))
+                raw = ldhdd._read_at(f, vol.cluster_off(a.cluster), 64)
+                self.assertEqual(raw[0:11], ldhdd.DOT_NAME)
+                self.assertEqual(struct.unpack_from("<H", raw, 26)[0], a.cluster)
+                self.assertEqual(raw[32:43], ldhdd.DOTDOT_NAME)
+                self.assertEqual(struct.unpack_from("<H", raw, 32 + 26)[0], vol.resolve_dir("/T" + size[:-1]))
+                top_cl = vol.resolve_dir("/T" + size[:-1])
+                raw = ldhdd._read_at(f, vol.cluster_off(top_cl), 64)
+                self.assertEqual(struct.unpack_from("<H", raw, 32 + 26)[0], 0)  # ルート直下の .. は 0
+                vol.walk_check()
+            finally:
+                f.close()
+            run_main(["info", path])
+            self.assertIn("起動部    : あり", run_main.out)
+            if shutil.which("fsck.fat"):
+                self.assertEqual(self.fsck(path), 0, size)
+
+    def fsck(self, path):
+        import subprocess
+        data = read(path)
+        part = os.path.join(self.dir, "part.img")
+        with open(part, "wb") as f:
+            f.write(data[128 * 512:len(data) - 512])
+        r = subprocess.run([shutil.which("fsck.fat"), "-n", part], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        os.remove(part)
+        return r.returncode
+
+    def test_directory_grows(self):
+        path = self.vhd("15M")  # 4KB クラスタ = 128 項目
+        for i in range(200):
+            self.put(os.path.join("MANY", "F%d.TXT" % i), b"%d" % i)
+        self.add(path, [os.path.join(self.src, "MANY")])
+        f, vol = self.open_vol(path)
+        try:
+            cl = vol.resolve_dir("/MANY")
+            self.assertGreaterEqual(len(vol.chain(cl, "MANY")), 2)
+            self.assertEqual(len(vol.read_dir(cl).entries), 200)
+            self.assertEqual(vol_read_file(vol, "/MANY/F199.TXT"), b"199")
+        finally:
+            f.close()
+        # 既にあるフォルダにさらに足して伸びる
+        for i in range(200, 330):
+            self.put(os.path.join("MORE", "MANY", "G%d.TXT" % i), b"%d" % i)
+        self.add(path, [os.path.join(self.src, "MORE", "MANY")])
+        f, vol = self.open_vol(path)
+        try:
+            self.assertEqual(len(vol.read_dir(vol.resolve_dir("/MANY")).entries), 330)
+            vol.walk_check()
+        finally:
+            f.close()
+        if shutil.which("fsck.fat"):
+            self.assertEqual(self.fsck(path), 0)
+
+    def test_existing_names(self):
+        path = self.vhd()
+        p = self.put("A.TXT", b"old" * 3000)
+        self.add(path, [p])
+        f, vol = self.open_vol(path)
+        free0 = len(vol.free_clusters())
+        f.close()
+        self.assert_refused(path, [p], "同じ名前のファイル")
+        p2 = os.path.join(self.dir, "new", "A.TXT")
+        os.makedirs(os.path.dirname(p2))
+        with open(p2, "wb") as fh:
+            fh.write(b"new")
+        self.add(path, [p2], overwrite=True)
+        f, vol = self.open_vol(path)
+        try:
+            self.assertEqual(vol_read_file(vol, "/A.TXT"), b"new")
+            self.assertEqual(len(vol.free_clusters()), free0 + 3 - 1)  # 古い 3 クラスタが空き、新しく 1
+        finally:
+            f.close()
+        # 同じ名前のフォルダには合わせて入る
+        self.put(os.path.join("D", "X.TXT"), b"x")
+        self.add(path, [os.path.join(self.src, "D")])
+        self.put(os.path.join("D2", "D", "Y.TXT"), b"y")
+        self.add(path, [os.path.join(self.src, "D2", "D")])
+        f, vol = self.open_vol(path)
+        try:
+            self.assertEqual(vol_read_file(vol, "/D/X.TXT"), b"x")
+            self.assertEqual(vol_read_file(vol, "/D/Y.TXT"), b"y")
+        finally:
+            f.close()
+        # ファイルとフォルダのぶつかり
+        self.put(os.path.join("D3", "A.TXT", "Z.TXT"), b"z")
+        self.assert_refused(path, [os.path.join(self.src, "D3", "A.TXT")], "同じ名前のファイル")
+        # 大文字にするとぶつかる入力
+        self.put(os.path.join("CASE", "a.txt"), b"1")
+        self.put(os.path.join("CASE", "A.TXT"), b"2")
+        if len(os.listdir(os.path.join(self.src, "CASE"))) == 2:  # 大文字小文字を区別するファイルシステムだけ
+            self.assert_refused(path, [os.path.join(self.src, "CASE")], "同じ名前になります")
+
+    def test_capacity_and_root_entries(self):
+        path = self.vhd("1M")
+        big = self.put("BIG.BIN", b"\0" * (2 << 20))
+        self.assert_refused(path, [big], "空きが足りません")
+        root = os.path.join(self.dir, "root")
+        os.mkdir(root)
+        ps = []
+        for i in range(513):
+            p = os.path.join(root, "R%d" % i)
+            with open(p, "wb"):
+                pass
+            ps.append(p)
+        self.assert_refused(path, ps, "ルートの項目が足りません")
+
+    def test_name_errors_and_dotfiles(self):
+        path = self.vhd()
+        self.put(os.path.join("P", "LONGFILENAME.TXT"), b"1")
+        self.put(os.path.join("P", "OK.TXT"), b"2")
+        self.put(os.path.join("P", "BAD*.TXT"), b"3")
+        before = sha(path)
+        with self.assertRaises(ldhdd.LdhddError) as cm:
+            self.add(path, [os.path.join(self.src, "P")])
+        self.assertIn("LONGFILENAME.TXT", str(cm.exception))
+        self.assertIn("BAD*.TXT", str(cm.exception))
+        self.assertEqual(sha(path), before)
+        self.put(os.path.join("Q", ".git", "HEAD"), b"x")
+        self.put(os.path.join("Q", "OK.TXT"), b"ok")
+        self.assert_refused(path, [os.path.join(self.src, "Q")], "「.」で始まる")
+        self.add(path, [os.path.join(self.src, "Q")], skip_dotfiles=True)
+        f, vol = self.open_vol(path)
+        try:
+            self.assertEqual(vol_read_file(vol, "/Q/OK.TXT"), b"ok")
+            self.assertEqual([ldhdd.short_to_text(e.name) for e in vol.read_dir(vol.resolve_dir("/Q")).entries], ["OK.TXT"])
+        finally:
+            f.close()
+        if os.name != "nt":
+            os.symlink(os.path.join(self.src, "Q"), os.path.join(self.src, "LNK"))
+            self.assert_refused(path, [os.path.join(self.src, "LNK")], "シンボリックリンク")
+
+    def test_dry_run_and_to(self):
+        path = self.vhd()
+        p = self.put("X.TXT", b"x")
+        before = sha(path)
+        self.add(path, [p], dry_run=True)
+        self.assertEqual(sha(path), before)
+        self.add(path, [p], to_path="/A/B")
+        f, vol = self.open_vol(path)
+        try:
+            self.assertEqual(vol_read_file(vol, "/A/B/X.TXT"), b"x")
+        finally:
+            f.close()
+
+    def corrupt(self, path, fn):
+        with ldhdd._open_target(path, True) as f:
+            vol = ldhdd.FatVolume(f)
+            fn(f, vol)
+
+    def write_fats(self, f, vol):
+        for k in range(vol.nfats):
+            f.seek(vol.fat_off + k * vol.fat_bytes)
+            f.write(bytes(vol.fat))
+
+    def test_broken_fat_refused(self):
+        p = self.put("N.TXT", b"n")
+        # 循環
+        path = self.vhd(name="c1.vhd")
+        self.add(path, [self.put("A.BIN", b"a" * 5000)])
+
+        def cycle(f, vol):
+            e = vol.find(vol.read_dir(0), ldhdd.to_short_name("A.BIN"))
+            ch = vol.chain(e.cluster, "A")
+            vol.set(ch[-1], ch[0])
+            self.write_fats(f, vol)
+        self.corrupt(path, cycle)
+        self.assert_refused(path, [p], "壊れています")
+        # 鎖の後ろの共有
+        path = self.vhd(name="c2.vhd")
+        self.add(path, [self.put("A.BIN", b"a" * 9000), self.put("B.BIN", b"b" * 9000)])
+
+        def share(f, vol):
+            ea = vol.find(vol.read_dir(0), ldhdd.to_short_name("A.BIN"))
+            eb = vol.find(vol.read_dir(0), ldhdd.to_short_name("B.BIN"))
+            ca, cb = vol.chain(ea.cluster, "A"), vol.chain(eb.cluster, "B")
+            vol.set(cb[0], ca[1])  # B の 2 番目から先を A と共有
+            for c in cb[1:]:
+                vol.set(c, 0)
+            self.write_fats(f, vol)
+        self.corrupt(path, share)
+        self.assert_refused(path, [p], "共有")
+        self.assert_refused(path, [self.put(os.path.join("o", "A.BIN"), b"z")], "共有", overwrite=True)
+        # 祖先を指すフォルダ
+        path = self.vhd(name="c3.vhd")
+        self.put(os.path.join("P1", "P2", "F.TXT"), b"f")
+        self.add(path, [os.path.join(self.src, "P1")])
+
+        def loop(f, vol):
+            p1 = vol.find(vol.read_dir(0), ldhdd.to_short_name("P1"))
+            p2 = vol.find(vol.read_dir(p1.cluster), ldhdd.to_short_name("P2"))
+            f.seek(p2.off + 26)
+            f.write(struct.pack("<H", p1.cluster))
+        self.corrupt(path, loop)
+        self.assert_refused(path, [p], "祖先")
+        self.assertEqual(run_main(["ls", path, "-R"]), 1)
+        # 第 2 FAT の食い違い
+        path = self.vhd(name="c4.vhd")
+        self.add(path, [self.put("A.BIN", b"a" * 5000)])
+
+        def second(f, vol):
+            f.seek(vol.fat_off + vol.fat_bytes + 3 * 3 // 2 + 10)
+            f.write(b"\x77")
+        self.corrupt(path, second)
+        self.assert_refused(path, [p], "食い違って")
+
+    def test_partition_over_footer(self):
+        path = self.vhd()
+        with open(path, "r+b") as f:
+            f.seek(0x1BE + 12)
+            n = struct.unpack("<I", f.read(4))[0]
+            f.seek(0x1BE + 12)
+            f.write(struct.pack("<I", n + 1))
+        self.assert_refused(path, [self.put("N.TXT")], "範囲")
+
+    def test_existing_directory_metadata(self):
+        path = self.vhd()
+        self.add(path, [self.put("A.TXT", b"a")])
+        with open(path, "r+b") as f:
+            f.seek(0)
+            vol = ldhdd.FatVolume(f)
+            listing = vol.read_dir(0)
+            slots = listing.slots
+            # [0] A.TXT / [1] 長い名前の項目 / [2] ボリュームラベル / [3] 消した項目 / [4] 終わり / [5] 古い項目
+            lfn = bytes([0x41]) + b"x\0" * 5 + bytes([0x0F, 0, 0]) + b"\0" * 18
+            self.assertEqual(len(lfn), 32)
+            label = b"MYLABEL    " + bytes([0x08]) + bytes(20)
+            deleted = b"\xe5LD     TXT" + bytes([0x20]) + bytes(20)
+            stale = ldhdd.make_dir_entry(b"STALE   TXT", 0x20, 0, 0, time.time())
+            for i, e in ((1, lfn), (2, label), (3, deleted), (4, bytes(32)), (5, stale)):
+                f.seek(slots[i])
+                f.write(e)
+        run_main(["ls", path])
+        self.assertNotIn("STALE", run_main.out)
+        self.assertNotIn("MYLABEL", run_main.out)
+        self.add(path, [self.put("B.TXT", b"b"), self.put("C.TXT", b"c")])
+        with open(path, "rb") as f:
+            vol = ldhdd.FatVolume(f)
+            slots = vol.read_dir(0).slots
+            self.assertEqual(ldhdd._read_at(f, slots[1], 32), lfn)
+            self.assertEqual(ldhdd._read_at(f, slots[2], 32), label)
+            names = sorted(ldhdd.short_to_text(e.name) for e in vol.read_dir(0).entries)
+            self.assertEqual(names, ["A.TXT", "B.TXT", "C.TXT"])
+            self.assertEqual(ldhdd._read_at(f, slots[3], 11), b"B       TXT")  # 消した項目の場所を使った
+            self.assertEqual(ldhdd._read_at(f, slots[4], 11), b"C       TXT")  # 終わりの印の場所を使った
+            self.assertEqual(ldhdd._read_at(f, slots[5], 1), b"\0")  # 印を置き直した
+        run_main(["ls", path])
+        self.assertNotIn("STALE", run_main.out)
+
+    def test_timestamps(self):
+        path = self.vhd()
+        p = self.put("T.TXT", b"t")
+        ts = time.mktime((2000, 1, 2, 3, 4, 6, 0, 0, -1))
+        os.utime(p, (ts, ts))
+        p2 = self.put("OLD.TXT", b"o")
+        os.utime(p2, (86400 * 10, 86400 * 10))
+        self.add(path, [p, p2])
+        f, vol = self.open_vol(path)
+        try:
+            e = vol.find(vol.read_dir(0), ldhdd.to_short_name("T.TXT"))
+            self.assertEqual(e.mdate, (20 << 9) | (1 << 5) | 2)
+            self.assertEqual(e.mtime, (3 << 11) | (4 << 5) | 3)
+            o = vol.find(vol.read_dir(0), ldhdd.to_short_name("OLD.TXT"))
+            self.assertEqual(o.mdate, (0 << 9) | (1 << 5) | 1)
+        finally:
+            f.close()
+
+    def test_write_failure_reports_backup(self):
+        path = self.vhd()
+        orig = ldhdd._write_all
+        calls = []
+
+        def fail(f, d):
+            calls.append(1)
+            if len(calls) == 2:
+                raise OSError(5, "injected")
+            return orig(f, d)
+        ldhdd._write_all = fail
+        try:
+            with self.assertRaisesRegex(ldhdd.LdhddError, "戻してください"):
+                self.add(path, [self.put("A.TXT", b"a" * 9000)], backup=True)
+        finally:
+            ldhdd._write_all = orig
+
+    def test_ls(self):
+        path = self.vhd()
+        self.put(os.path.join("L", "S", "F.TXT"), b"f")
+        self.add(path, [os.path.join(self.src, "L")])
+        self.assertEqual(run_main(["ls", path]), 0)
+        self.assertIn("L", run_main.out)
+        self.assertIn("<DIR>", run_main.out)
+        self.assertEqual(run_main(["ls", path, "/L", "-R"]), 0)
+        self.assertIn("/L/S:", run_main.out)
+        self.assertIn("F.TXT", run_main.out)
+        self.assertIn("空き:", run_main.out)
+        self.assertEqual(run_main(["ls", path, "/NONE"]), 1)
+
+    def test_cli_add(self):
+        path = self.vhd()
+        p = self.put(os.path.join("C", "A.TXT"), b"a")
+        self.assertEqual(run_main(["add", path, os.path.join(self.src, "C"), "--no-backup"]), 0, run_main.err)
+        self.assertIn("完了しました", run_main.out)
+        self.assertEqual(run_main(["add", path, os.path.join(self.src, "C"), "--no-backup"]), 1)
+        self.assertIn("同じ名前のファイル", run_main.err)
 
 
 @unittest.skipUnless(os.environ.get("LDHDD_LDSYS"), "LDHDD_LDSYS が無い")
