@@ -22,11 +22,13 @@ import argparse
 import datetime
 import errno
 import hashlib
+import io
 import os
 import re
 import shutil
 import struct
 import sys
+import time
 from typing import Dict, List, NamedTuple, Optional, Tuple
 
 __version__ = "1.0.0"
@@ -808,7 +810,7 @@ def _create_staging(d: str) -> Tuple[int, str]:
     for _ in range(100):
         tmp = os.path.join(d, ".ldhdd%s.part" % os.urandom(3).hex())
         try:
-            return os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o600), tmp
+            return os.open(tmp, os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o600), tmp
         except FileExistsError:
             continue
     raise OSError(errno.EEXIST, "仮ファイルの名前を決められません")
@@ -857,15 +859,30 @@ def _publish_no_replace(tmp: str, dst: str) -> Optional[str]:
 MOVEFILE_WRITE_THROUGH = 0x8
 
 
-def _windows_move_no_replace(src: str, dst: str, kernel32=None) -> None:
-    """MoveFileExW を MOVEFILE_REPLACE_EXISTING 無しで呼ぶ (既にある名前には失敗する)。
-    MOVEFILE_WRITE_THROUGH で、名前の変更がディスクに書き切られてから戻る。"""
+MOVEFILE_REPLACE_EXISTING = 0x1
+
+
+def _windows_move(src: str, dst: str, flags: int, kernel32=None) -> None:
+    """MoveFileExW を呼ぶ。MOVEFILE_WRITE_THROUGH で、名前の変更がディスクに書き切られてから戻る"""
     import ctypes
     if kernel32 is None:
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    if not kernel32.MoveFileExW(src, dst, MOVEFILE_WRITE_THROUGH):
+    if not kernel32.MoveFileExW(src, dst, flags):
         err = ctypes.get_last_error() if hasattr(ctypes, "get_last_error") else 0
         raise OSError(err, "MoveFileExW が失敗しました (%d)" % err)
+
+
+def _windows_move_no_replace(src: str, dst: str, kernel32=None) -> None:
+    """MOVEFILE_REPLACE_EXISTING 無し (既にある名前には失敗する) + 書き切り"""
+    _windows_move(src, dst, MOVEFILE_WRITE_THROUGH, kernel32)
+
+
+def _replace_durable(src: str, dst: str) -> None:
+    """src で dst を置き換える。Windows は MoveFileExW の書き切り、POSIX は os.replace (後でディレクトリを fsync)"""
+    if _IS_WINDOWS:
+        _windows_move(src, dst, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)
+    else:
+        os.replace(src, dst)
 
 
 def _lock_windows(f, msvcrt_mod):
@@ -971,12 +988,40 @@ def _update_locked(f, target, inputs, sys_bin, unit, backup, force, dry_run, out
     return bak
 
 
+def describe_fat(pb: bytes, p1: "Partition", vk: VhdKind) -> str:
+    """第 1 パーティションの BPB を info 用に説明する (壊れていても例外にしない)"""
+    if len(pb) < 62:
+        return "BPB を読めません (パーティションがファイルの外)"
+    if not looks_like_bpb(pb):
+        return "BPB がありません"
+    bps, spc, res, nf, root = _u16(pb, 11), pb[13], _u16(pb, 14), pb[16], _u16(pb, 17)
+    spf = _u16(pb, 22)
+    tot = _u16(pb, 19) or _u32(pb, 32)
+    if spf == 0:
+        return "FAT32 など (HDD.COM では使えません)"
+    if not bps or not spc:
+        return "BPB が壊れています"
+    if (p1.lba + p1.count) * SECTOR > vk.data_size:
+        return "パーティションがファイルの外にはみ出しています"
+    if tot * bps > p1.count * SECTOR:
+        return "BPB の大きさ (%d バイト) がパーティション (%d バイト) を越えています" % (tot * bps, p1.count * SECTOR)
+    ds = res + nf * spf + (root * 32 + bps - 1) // bps
+    cl = (tot - ds) // spc if tot > ds else 0
+    # ラベル欄は拡張ブート署名 (29h) がある時だけ。表示できない文字は ? にする
+    label = "".join(chr(c) if 0x20 <= c < 0x7F else "?" for c in pb[43:54]).rstrip() if pb[38] == 0x29 else "(なし)"
+    return ("FAT%d、クラスタ %d バイト x %d (データ %.1fMB)、ラベル %s"
+            % (12 if cl < 4085 else 16, bps * spc, cl, cl * bps * spc / 1048576.0, label))
+
+
 def info(target: str, out=None) -> None:
     if out is None:
         out = sys.stdout
     with _open_target(target, False) as f:
         vk = vhd_kind_of(f)
         head = _read_at(f, 0, IPL_LOAD_SIZE)
+        p1 = read_partitions(head)[0] if len(head) >= SECTOR else None
+        pb1 = (_read_at(f, p1.lba * SECTOR, SECTOR)
+               if p1 is not None and p1.ptype and (p1.lba + 1) * SECTOR <= vk.data_size else b"")
     print("対象      : %s (%s, データ %d バイト)" % (target, "固定 VHD" if vk.kind == "fixed" else "フッター無しの生イメージ", vk.data_size), file=out)
     if len(head) < SECTOR or head[510:512] != b"\x55\xaa":
         print("MBR       : なし", file=out)
@@ -984,6 +1029,9 @@ def info(target: str, out=None) -> None:
         for p in read_partitions(head):
             if p.ptype:
                 print("パーティション %d: 種類 %02X 開始 LBA %d (%d バイト目) %d セクタ" % (p.index, p.ptype, p.lba, p.lba * SECTOR, p.count), file=out)
+        p1 = read_partitions(head)[0]
+        if p1.ptype:
+            print("FAT       : %s" % describe_fat(pb1, p1, vk), file=out)
     ex = existing_boot(head)
     if not ex.present:
         print("起動部    : なし", file=out)
@@ -999,6 +1047,286 @@ def info(target: str, out=None) -> None:
         print("unit      : スタブで %d を指定" % si.unit_override, file=out)
     else:
         print("unit      : スタブでの指定なし (unit は COM 次第)", file=out)
+
+
+# ---------------------------------------------------------------------------
+# new: 容量を指定して、起動できる固定 VHD を新しく作る
+# ---------------------------------------------------------------------------
+
+NEW_PART_LBA = 128  # 64KB。IPL が読む 0xF000 と起動部の後ろ、HDD.COM の 32768 未満
+NEW_MIN_SIZE = 1024 * 1024
+NEW_MAX_SIZE = 512 * 1024 * 1024
+NEW_RESERVED = 1
+NEW_NFATS = 2
+NEW_ROOT = 512
+NEW_MEDIA = 0xF8
+NO_LABEL = b"NO NAME    "
+LABEL_CHARS = set(b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 !#$%&'()-@^_`{}~")
+VHD_EPOCH = 946684800  # 2000-01-01 00:00:00 UTC
+
+
+def parse_size(text: str) -> int:
+    """「128M」「16448K」「128」(単位なしは MB) をバイト数にする。1MB〜512MB"""
+    m = re.fullmatch(r"\s*(\d{1,12})\s*([kKmM]?)\s*", text or "")
+    if not m:
+        raise LdhddError("容量の書き方が違います (%r)。例: 128M、16448K" % (text,))
+    unit = (m.group(2) or "M").upper()
+    size = int(m.group(1)) * (1024 if unit == "K" else 1024 * 1024)
+    if size % SECTOR:
+        raise LdhddError("容量は 512 バイトの倍数にしてください (%d バイト)" % size)
+    if not NEW_MIN_SIZE <= size <= NEW_MAX_SIZE:
+        raise LdhddError("容量は 1MB 以上 512MB 以下にしてください (%d バイト)" % size)
+    return size
+
+
+class FatLayout(NamedTuple):
+    fat_bits: int
+    spc: int
+    spf: int
+    clusters: int
+    total: int  # パーティションのセクタ数
+    reserved: int = NEW_RESERVED
+
+
+def _fat_layout_for(total: int, spc: int, bits: int) -> Optional[FatLayout]:
+    """spc と FAT の型を決めた時の spf とクラスタ数 (FAT が足りるまで spf を増やす)"""
+    root_secs = NEW_ROOT * 32 // SECTOR
+    spf = 1
+    while True:
+        # LSX-Dodgers の DPB_ADDCL (= データ領域の位置 - 2 クラスタ) が負にならないよう、
+        # 足りなければ予約セクタを足してデータ領域を 2 クラスタ分より後ろにする
+        reserved = max(NEW_RESERVED, 2 * spc - NEW_NFATS * spf - root_secs)
+        data_start = reserved + NEW_NFATS * spf + root_secs
+        if data_start >= total:
+            return None
+        clusters = (total - data_start) // spc
+        if spf * SECTOR >= ((clusters + 2) * bits + 7) // 8:
+            return FatLayout(bits, spc, spf, clusters, total, reserved)
+        spf += 1
+
+
+def choose_fat_layout(total: int, fat: str = "auto") -> FatLayout:
+    """パーティション total セクタの FAT の形を決める。
+    auto: 32768 セクタ (16MB) 未満は FAT12、以上は FAT16"""
+    if fat == "auto":
+        fat = "12" if total < 32768 else "16"
+    if fat == "12":
+        spc = 1
+        while True:
+            lay = _fat_layout_for(total, spc, 12)
+            if lay is not None and 1 <= lay.clusters < 4085:
+                break
+            spc *= 2
+            if spc > 128:
+                raise LdhddError("この容量 (パーティション %d セクタ) は FAT12 にできません" % total)
+    elif fat == "16":
+        spc = 4 if total <= 262144 else 8 if total <= 524288 else 16
+        lay = _fat_layout_for(total, spc, 16)
+        while (lay is None or lay.clusters < 4085) and spc > 1:
+            spc //= 2
+            lay = _fat_layout_for(total, spc, 16)
+        if lay is None or not 4085 <= lay.clusters <= 65524:
+            raise LdhddError("この容量 (パーティション %d セクタ) は FAT16 にできません" % total)
+    else:
+        raise LdhddError("--fat は auto / 12 / 16 です (%r)" % (fat,))
+    try:
+        check_fat_bpb(build_bpb(lay, NEW_PART_LBA, NO_LABEL, 0), total)
+    except LdhddError as e:
+        raise LdhddError("この容量 (パーティション %d セクタ) では、HDD.COM で使える FAT%s にできません (%s)" % (total, fat, e))
+    return lay
+
+
+def parse_label(text: str) -> bytes:
+    """ボリュームラベル: ASCII、英小文字は大文字に、FAT の短い名前と同じ文字、1〜11 バイト"""
+    try:
+        raw = text.upper().encode("ascii")
+    except UnicodeEncodeError:
+        raise LdhddError("ボリュームラベルは ASCII の文字だけにしてください (%r)" % (text,))
+    if not 1 <= len(raw) <= 11:
+        raise LdhddError("ボリュームラベルは 1〜11 文字にしてください (%r)" % (text,))
+    if raw[0] == 0x20:
+        raise LdhddError("ボリュームラベルの先頭に空白は使えません")
+    bad = sorted(set(chr(c) for c in raw if c not in LABEL_CHARS))
+    if bad:
+        raise LdhddError("ボリュームラベルに使えない文字があります: %s" % " ".join(bad))
+    return raw.ljust(11, b" ")
+
+
+def build_bpb(lay: FatLayout, part_lba: int, label: bytes, volume_id: int) -> bytes:
+    b = bytearray(SECTOR)
+    b[0:3] = b"\xeb\x3c\x90"
+    b[3:11] = b"MSDOS5.0"
+    tot16 = lay.total if lay.total < 0x10000 else 0
+    struct.pack_into("<HBHBHHBHHHI", b, 11, SECTOR, lay.spc, lay.reserved, NEW_NFATS, NEW_ROOT,
+                     tot16, NEW_MEDIA, lay.spf, 63, 255, part_lba)
+    struct.pack_into("<I", b, 32, 0 if tot16 else lay.total)
+    b[36] = 0x80  # ドライブ番号
+    b[38] = 0x29  # 拡張ブート署名
+    struct.pack_into("<I", b, 39, volume_id)
+    b[43:54] = label
+    b[54:62] = b"FAT12   " if lay.fat_bits == 12 else b"FAT16   "
+    b[510:512] = b"\x55\xaa"
+    return bytes(b)
+
+
+def fat_head(lay: FatLayout) -> bytes:
+    return bytes([NEW_MEDIA, 0xFF, 0xFF]) + (b"\xff" if lay.fat_bits == 16 else b"")
+
+
+def _lba_to_chs(lba: int) -> bytes:
+    c = lba // (255 * 63)
+    if c > 1023:
+        return b"\xfe\xff\xff"
+    h = (lba // 63) % 255
+    s = lba % 63 + 1
+    return bytes([h, ((c >> 2) & 0xC0) | s, c & 0xFF])
+
+
+def partition_type(lay: FatLayout) -> int:
+    if lay.fat_bits == 12:
+        return 0x01
+    return 0x04 if lay.total < 0x10000 else 0x06
+
+
+def build_mbr(part_lba: int, part_sectors: int, ptype: int, disk_sig: int) -> bytes:
+    """0〜0x1B7 は 0 (後で boot_record が起動セクタにする)、ディスク署名、第 1 パーティション"""
+    m = bytearray(SECTOR)
+    struct.pack_into("<I", m, 0x1B8, disk_sig)
+    m[0x1BE:0x1CE] = (bytes([0x00]) + _lba_to_chs(part_lba) + bytes([ptype])
+                      + _lba_to_chs(part_lba + part_sectors - 1) + struct.pack("<II", part_lba, part_sectors))
+    m[510:512] = b"\x55\xaa"
+    return bytes(m)
+
+
+def vhd_geometry(total_sectors: int) -> Tuple[int, int, int]:
+    """VHD 仕様の CHS の決め方。(シリンダ, ヘッド, トラックあたりセクタ)"""
+    ts = min(total_sectors, 65535 * 16 * 255)
+    if ts >= 65535 * 16 * 63:
+        spt, heads = 255, 16
+        cth = ts // spt
+    else:
+        spt = 17
+        cth = ts // spt
+        heads = max(4, (cth + 1023) // 1024)
+        if cth >= heads * 1024 or heads > 16:
+            spt, heads = 31, 16
+            cth = ts // spt
+        if cth >= heads * 1024:
+            spt, heads = 63, 16
+            cth = ts // spt
+    return cth // heads, heads, spt
+
+
+def build_vhd_footer(data_size: int, timestamp: int, uuid: bytes) -> bytes:
+    f = bytearray(SECTOR)
+    f[0:8] = b"conectix"
+    cyl, heads, spt = vhd_geometry(data_size // SECTOR)
+    struct.pack_into(">IIQI4sI4sQQHBBI", f, 8, 0x00000002, 0x00010000, 0xFFFFFFFFFFFFFFFF,
+                     timestamp & 0xFFFFFFFF, b"ldhd", 0x00010000, b"Wi2k", data_size, data_size,
+                     cyl, heads, spt, 2)
+    f[68:84] = uuid
+    struct.pack_into(">I", f, 64, vhd_checksum(bytes(f)))
+    return bytes(f)
+
+
+def _same_file(a: str, b: str) -> bool:
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        return False
+
+
+def new_image(path: str, size: int, inputs: Inputs, input_paths: List[str], unit: int = 0,
+              fat: str = "auto", label: Optional[str] = None, force: bool = False, out=None) -> FatLayout:
+    """MBR + FAT12/16 + 起動部 + 固定 VHD フッターの新しい VHD を作る"""
+    if out is None:
+        out = sys.stdout
+    # 入力・容量・ラベルの誤りは、ファイルを作る前に出す
+    sys_bin = makesys(inputs.ld_bin, inputs.com, unit)
+    total = size // SECTOR
+    lay = choose_fat_layout(total - NEW_PART_LBA, fat)
+    label_b = parse_label(label) if label is not None else NO_LABEL
+    bpb = build_bpb(lay, NEW_PART_LBA, label_b, int.from_bytes(os.urandom(4), "little"))
+    check_fat_bpb(bpb, lay.total)  # 作った形が HDD.COM で使えること (通らなければ作りの誤り)
+    for p in input_paths:
+        if p and _same_file(p, path):
+            raise LdhddError("出力先 %s が入力 (%s) と同じファイルです" % (path, p))
+    if os.path.isdir(path):
+        raise LdhddError("%s はディレクトリです" % path)
+    if os.path.lexists(path) and not force:
+        raise LdhddError("%s は既にあります。置き換えるなら --force を付けてください" % path)
+    disk_sig = 0
+    while disk_sig == 0:
+        disk_sig = int.from_bytes(os.urandom(4), "little")
+    mbr = build_mbr(NEW_PART_LBA, lay.total, partition_type(lay), disk_sig)
+    footer = build_vhd_footer(size, int(time.time()) - VHD_EPOCH, os.urandom(16))
+    base = NEW_PART_LBA * SECTOR
+
+    d = _backup_dir(path)
+    if force:
+        fd, created = _create_staging(d)
+    else:
+        try:
+            fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o666)
+        except FileExistsError:
+            raise LdhddError("%s は既にあります。置き換えるなら --force を付けてください" % path)
+        created = path
+    committed = False
+    mine = None
+    f = None
+    try:
+        mine = os.fstat(fd)
+        f = os.fdopen(fd, "r+b", buffering=0)
+        with f:
+            f.truncate(size)
+            for off, data in ((0, mbr), (base, bpb)):
+                f.seek(off)
+                _write_all(f, data)
+            for k in range(NEW_NFATS):
+                f.seek(base + (lay.reserved + k * lay.spf) * SECTOR)
+                _write_all(f, fat_head(lay))
+            if label is not None:
+                f.seek(base + (lay.reserved + NEW_NFATS * lay.spf) * SECTOR)
+                _write_all(f, label_b + bytes([0x08]) + bytes(20))
+            f.seek(size)
+            _write_all(f, footer)
+            os.fsync(f.fileno())
+            # A1 の update と同じ検査を通して起動部を書く (作った物の確かめを兼ねる)
+            _update_locked(f, path, inputs, sys_bin, unit, False, False, False, io.StringIO())
+            os.fsync(f.fileno())
+        if force:
+            _replace_durable(created, path)  # ここが確定
+        committed = True
+    except BaseException as e:
+        if f is None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        left = None
+        if not committed:
+            # 自分が作ったファイルがその名前のままの時だけ消す (同一性を読めなかった時は、作った直後なので消す)
+            try:
+                if mine is None or os.path.samestat(os.stat(created), mine):
+                    os.remove(created)
+            except FileNotFoundError:
+                pass
+            except OSError as ce:
+                left = "作りかけのファイル %s を消せませんでした (%s)。手で消してください" % (created, ce)
+        if isinstance(e, OSError):
+            if left:
+                rest = left + ("。元のファイルはそのままです" if force else "")
+            else:
+                rest = "元のファイルはそのままです" if force else "何も残していません"
+            raise LdhddError("作れませんでした (%s)。%s" % (e, rest))
+        if left:
+            print("注意: " + left, file=sys.stderr)
+        raise
+    try:
+        _fsync_dir(d)
+    except OSError as e:
+        raise LdhddError("新しいイメージ %s は置かれましたが、ディスクへの書き込みが確かではありません (%s)" % (path, e))
+    return lay
 
 
 def write_new_file(path: str, data: bytes, force: bool) -> None:
@@ -1036,6 +1364,15 @@ def build_parser() -> argparse.ArgumentParser:
     add_inputs(p)
     p.add_argument("--force", action="store_true", help="出力ファイルがあれば上書きする")
 
+    p = sub.add_parser("new", help="容量を指定して、起動できる固定 VHD を新しく作る")
+    p.add_argument("output", help="作る VHD のファイル名")
+    p.add_argument("--size", required=True, help="VHD 全体の大きさ (例: 128M、16448K。単位なしは MB。1MB〜512MB)")
+    add_inputs(p)
+    p.add_argument("--fat", default="auto", choices=("auto", "12", "16"),
+                   help="FAT の種類 (既定 auto: パーティションが 16MB 未満は FAT12、以上は FAT16)")
+    p.add_argument("--label", help="ボリュームラベル (英数字など 11 文字まで)")
+    p.add_argument("--force", action="store_true", help="出力先が既にあれば置き換える")
+
     p = sub.add_parser("info", help="VHD の起動部とパーティションを表示する")
     p.add_argument("target")
     return ap
@@ -1053,6 +1390,13 @@ def main(argv: Optional[List[str]] = None) -> int:
             data = makesys(inputs.ld_bin, inputs.com, args.unit)
             write_new_file(args.output, data, args.force)
             print("%s を作りました (%d バイト, %s + %s)" % (args.output, len(data), ld_version(inputs.ld_bin), describe_com(inputs.com)))
+        elif args.cmd == "new":
+            size = parse_size(args.size)
+            inputs = load_inputs(args.ldsys, args.ld_bin, args.hdd_com)
+            new_image(args.output, size, inputs, [args.ldsys, args.ld_bin, args.hdd_com], unit=args.unit,
+                      fat=args.fat, label=args.label, force=args.force)
+            print("%s を作りました (%d バイト + VHD フッター)" % (args.output, size))
+            info(args.output)
         elif args.cmd == "info":
             info(args.target)
     except (LdhddError, OSError) as e:

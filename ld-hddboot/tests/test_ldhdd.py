@@ -10,6 +10,7 @@ import contextlib
 import hashlib
 import io
 import os
+import shutil
 import struct
 import sys
 import tempfile
@@ -1160,6 +1161,459 @@ class TestInfo(unittest.TestCase):
             run_main(["info", v2])
             self.assertIn("スタブでの指定なし", run_main.out)
             self.assertIn("HDD1.COM (旧来の HDD1 用)", run_main.out)
+
+
+class TestNewParts(unittest.TestCase):
+    def test_parse_size(self):
+        self.assertEqual(ldhdd.parse_size("128M"), 128 << 20)
+        self.assertEqual(ldhdd.parse_size("128m"), 128 << 20)
+        self.assertEqual(ldhdd.parse_size("128"), 128 << 20)
+        self.assertEqual(ldhdd.parse_size("1024K"), 1 << 20)
+        self.assertEqual(ldhdd.parse_size("512M"), 512 << 20)
+        for bad in ("0", "513M", "1K", "1.5M", "abc", "-1M", "", "9" * 5000):
+            with self.assertRaises(ldhdd.LdhddError, msg=bad):
+                ldhdd.parse_size(bad)
+
+    def test_choose_fat_layout(self):
+        mb = 2048  # 1MB のセクタ数
+        cases = [(1 * mb, 12, None), (15 * mb, 12, 8), (32767, 12, None), (32768, 16, 4),
+                 (128 * mb, 16, 4), (129 * mb, 16, 8), (256 * mb, 16, 8), (512 * mb - 128, 16, 16)]
+        for total, bits, spc in cases:
+            lay = ldhdd.choose_fat_layout(total)
+            self.assertEqual(lay.fat_bits, bits, total)
+            if spc:
+                self.assertEqual(lay.spc, spc, total)
+            self.assertTrue(lay.clusters < 4085 if bits == 12 else 4085 <= lay.clusters <= 65524, total)
+            ldhdd.check_fat_bpb(ldhdd.build_bpb(lay, 128, ldhdd.NO_LABEL, 1), total)
+
+    def test_forced_fat(self):
+        mb = 2048
+        lay = ldhdd.choose_fat_layout(128 * mb - 128, "12")
+        self.assertEqual((lay.fat_bits, lay.spc), (12, 128))
+        self.assertLess(lay.clusters, 4085)
+        # データ領域の位置が 2 クラスタ分 (256 セクタ) 以上になるよう、予約セクタを足している
+        self.assertGreaterEqual(lay.reserved + 2 * lay.spf + 32, 2 * lay.spc)
+        with self.assertRaisesRegex(ldhdd.LdhddError, "FAT12 にできません"):
+            ldhdd.choose_fat_layout(512 * mb - 128, "12")
+        with self.assertRaisesRegex(ldhdd.LdhddError, "FAT16 にできません"):
+            ldhdd.choose_fat_layout(1 * mb - 128, "16")
+        lay = ldhdd.choose_fat_layout(5 * mb - 128, "16")
+        self.assertEqual(lay.fat_bits, 16)
+        self.assertGreaterEqual(lay.clusters, 4085)
+        self.assertLess(lay.spc, 4)
+
+    def test_parse_label(self):
+        self.assertEqual(ldhdd.parse_label("ABCDEFGHIJK"), b"ABCDEFGHIJK")
+        self.assertEqual(ldhdd.parse_label("ldhdd"), b"LDHDD      ")
+        for bad in ("ABCDEFGHIJKL", "", " X", "A*B", "A.B", 'A"B', "ラベル"):
+            with self.assertRaises(ldhdd.LdhddError, msg=bad):
+                ldhdd.parse_label(bad)
+
+    def test_vhd_geometry(self):
+        mb = 2048
+        self.assertEqual(ldhdd.vhd_geometry(128 * mb), (963, 16, 17))
+        self.assertEqual(ldhdd.vhd_geometry(192 * mb), (393216 // 31 // 16, 16, 31))
+        self.assertEqual(ldhdd.vhd_geometry(256 * mb), (524288 // 63 // 16, 16, 63))
+        self.assertEqual(ldhdd.vhd_geometry(512 * mb), (1048576 // 63 // 16, 16, 63))
+        self.assertEqual(ldhdd.vhd_geometry(1 * mb), (2048 // 17 // 4, 4, 17))
+
+    def test_footer_accepted(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = os.path.join(td, "x.vhd")
+            with open(p, "wb") as f:
+                f.truncate(1 << 20)
+                f.seek(1 << 20)
+                f.write(ldhdd.build_vhd_footer(1 << 20, 12345, b"\x01" * 16))
+            with ldhdd._open_target(p, False) as f:
+                self.assertEqual(ldhdd.vhd_kind_of(f), ldhdd.VhdKind("fixed", 1 << 20))
+
+
+class TestNew(unittest.TestCase):
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+        self.dir = self.td.name
+        self.com = read(HDD_COM)
+        self.ld = ldhdd.files_from_d88(MKLDHD)["LD.BIN"][135 + len(self.com):]
+        self.inputs = inputs_from(self.ld, self.com)
+
+    def tearDown(self):
+        self.td.cleanup()
+
+    def new(self, name="n.vhd", size="16M", **kw):
+        path = os.path.join(self.dir, name)
+        lay = ldhdd.new_image(path, ldhdd.parse_size(size), kw.pop("inputs", self.inputs), kw.pop("paths", []),
+                              out=io.StringIO(), **kw)
+        return path, lay
+
+    def part_bpb(self, path):
+        with open(path, "rb") as f:
+            f.seek(128 * 512)
+            return f.read(512)
+
+    def test_sizes_and_types(self):
+        for size, ptype, bits in (("1M", 0x01, 12), ("15M", 0x01, 12), ("16M", 0x01, 12),
+                                  ("16448K", 0x04, 16), ("128M", 0x06, 16)):
+            path, lay = self.new("t%s.vhd" % size, size)
+            data_size = ldhdd.parse_size(size)
+            self.assertEqual(os.path.getsize(path), data_size + 512, size)
+            self.assertEqual(lay.fat_bits, bits, size)
+            with open(path, "rb") as f:
+                head = f.read(0xF000)
+            p1 = ldhdd.read_partitions(head)[0]
+            self.assertEqual((p1.ptype, p1.lba, p1.count), (ptype, 128, data_size // 512 - 128), size)
+            # A1 の検査をすべて通る
+            with ldhdd._open_target(path, False) as f:
+                ldhdd.check_target(f, len(ldhdd.makesys(self.ld, self.com)))
+            sys_bin = ldhdd.makesys(self.ld, self.com)
+            self.assertEqual(head[0x200:0x200 + len(sys_bin)], sys_bin)
+            self.assertEqual(head[0x190:0x190 + ldhdd.META_LEN], ldhdd.boot_meta(sys_bin))
+            self.assertNotEqual(head[0x1B8:0x1BC], bytes(4))
+            run_main(["info", path])
+            self.assertIn("パーティション 1: 種類 %02X 開始 LBA 128" % ptype, run_main.out)
+            self.assertIn("FAT%d" % bits, run_main.out)
+            self.assertIn("version 1.61b", run_main.out)
+
+    def test_unit_label_and_update_after(self):
+        path, lay = self.new(size="128M", unit=1, label="ldhdd")
+        bpb = self.part_bpb(path)
+        self.assertEqual(bpb[43:54], b"LDHDD      ")
+        with open(path, "rb") as f:
+            f.seek((128 + 1 + 2 * lay.spf) * 512)
+            ent = f.read(32)
+        self.assertEqual(ent[:11], b"LDHDD      ")
+        self.assertEqual(ent[11], 0x08)
+        run_main(["info", path])
+        self.assertIn("スタブで 1 を指定", run_main.out)
+        # 作った物にそのまま update をかけられる
+        ld2 = fake_ld_bin(top=0xD100, body_len=9721, fill=0x77)
+        ldhdd.update(path, inputs_from(ld2, self.com), backup=False, out=io.StringIO())
+        with open(path, "rb") as f:
+            f.seek(0x200)
+            self.assertEqual(f.read(len(ldhdd.makesys(ld2, self.com))), ldhdd.makesys(ld2, self.com))
+
+    def test_forced_fat12_128m_end_to_end(self):
+        path, lay = self.new("f12.vhd", "128M", fat="12")
+        self.assertEqual((lay.fat_bits, lay.spc), (12, 128))
+        # update --dry-run (A1 の検査) も通る
+        self.assertEqual(run_main(["update", path, "--dry-run", "--ldsys", MKLDHD, "--ld-bin", self.raw_ld()]), 0, run_main.err)
+        if shutil.which("fsck.fat"):
+            self.assertEqual(self.fsck(path), 0)
+
+    def raw_ld(self):
+        p = os.path.join(self.dir, "rawld.bin")
+        if not os.path.exists(p):
+            with open(p, "wb") as f:
+                f.write(self.ld)
+        return p
+
+    def fsck(self, path):
+        import subprocess
+        data = read(path)
+        part = os.path.join(self.dir, "part.img")
+        with open(part, "wb") as f:
+            f.write(data[128 * 512:len(data) - 512])
+        r = subprocess.run([shutil.which("fsck.fat"), "-n", part], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        os.remove(part)
+        return r.returncode
+
+    def test_info_truncated_and_fat32(self):
+        # パーティションがファイルの外 / FAT32 の BPB でも info は落ちない
+        path = os.path.join(self.dir, "x.vhd")
+        mbr = bytearray(512)
+        mbr[0x1BE:0x1CE] = struct.pack("<B3sB3sII", 0, b"\0\0\0", 0x06, b"\0\0\0", 5000, 100)
+        mbr[510:512] = b"\x55\xaa"
+        with open(path, "wb") as f:
+            f.write(bytes(mbr) + bytes(0x10000))
+        self.assertEqual(run_main(["info", path]), 0, run_main.err)
+        self.assertIn("BPB を読めません", run_main.out)
+        path2, lay = self.new("y.vhd", "16M")
+        with open(path2, "r+b") as f:
+            f.seek(128 * 512 + 22)
+            f.write(b"\0\0")  # FAT16 の spf を 0 に (FAT32 の形)
+        self.assertEqual(run_main(["info", path2]), 0, run_main.err)
+        self.assertIn("FAT32", run_main.out)
+
+    @unittest.skipIf(os.name == "nt", "Windows は開いているファイルを置き換えられない")
+    def test_failed_creator_keeps_others_output(self):
+        # 失敗した時の後始末は、自分が作ったファイルのままの時だけ消す
+        path = os.path.join(self.dir, "n.vhd")
+        orig = ldhdd._write_all
+        calls = []
+        replaced = []
+
+        def fail(f, d):
+            calls.append(1)
+            if len(calls) == 2:
+                other = os.path.join(self.dir, "other.tmp")
+                with open(other, "wb") as o:
+                    o.write(b"other")
+                os.replace(other, path)  # ほかの誰かがその名前に置いた
+                replaced.append(True)
+                raise OSError(5, "injected")
+            return orig(f, d)
+        ldhdd._write_all = fail
+        try:
+            with self.assertRaisesRegex(ldhdd.LdhddError, "injected"):
+                self.new()
+        finally:
+            ldhdd._write_all = orig
+        self.assertEqual(replaced, [True])
+        self.assertEqual(read(path), b"other")
+
+    def test_fstat_failure_leaves_nothing(self):
+        orig = ldhdd.os.fstat
+        for force in (False, True):
+            path = os.path.join(self.dir, "n.vhd")
+            if force:
+                with open(path, "wb") as f:
+                    f.write(b"keep")
+            state = {"done": False}
+
+            def fstat(fd):
+                if not state["done"]:
+                    state["done"] = True
+                    raise OSError(5, "injected")
+                return orig(fd)
+            ldhdd.os.fstat = fstat
+            try:
+                with self.assertRaisesRegex(ldhdd.LdhddError, "injected"):
+                    self.new(force=force)
+            finally:
+                ldhdd.os.fstat = orig
+            self.assertEqual(os.listdir(self.dir), ["n.vhd"] if force else [], force)
+            if force:
+                self.assertEqual(read(path), b"keep")
+                os.remove(path)
+
+    class FakeKernel32:
+        """MoveFileExW の偽物。MOVEFILE_REPLACE_EXISTING (0x1) が立っていれば置き換える。fail で失敗させる"""
+        def __init__(self, fail=False):
+            self.calls = []
+            self.fail = fail
+
+        def MoveFileExW(self, src, dst, flags):
+            self.calls.append(flags)
+            if self.fail or (os.path.exists(dst) and not flags & 0x1):
+                return 0
+            os.replace(src, dst)
+            return 1
+
+    def windows_mode(self, k):
+        orig = (ldhdd._IS_WINDOWS, ldhdd._windows_move)
+        ldhdd._IS_WINDOWS = True
+        ldhdd._windows_move = lambda s_, d_, fl, kernel32=None: orig[1](s_, d_, fl, kernel32=k)
+        return orig
+
+    def test_windows_force_replace_write_through(self):
+        path = os.path.join(self.dir, "n.vhd")
+        with open(path, "wb") as f:
+            f.write(b"keep")
+        k = self.FakeKernel32()
+        orig = self.windows_mode(k)
+        try:
+            self.new(force=True)
+        finally:
+            ldhdd._IS_WINDOWS, ldhdd._windows_move = orig
+        self.assertEqual(k.calls, [0x1 | 0x8])  # REPLACE_EXISTING | WRITE_THROUGH
+        self.assertEqual(os.path.getsize(path), (16 << 20) + 512)
+        self.assertEqual(os.listdir(self.dir), ["n.vhd"])
+        # 置き換えに失敗したら、元のファイルはそのまま・仮ファイルは残らない
+        with open(path, "wb") as f:
+            f.write(b"keep")
+        k2 = self.FakeKernel32(fail=True)
+        orig = self.windows_mode(k2)
+        try:
+            with self.assertRaisesRegex(ldhdd.LdhddError, "元のファイルはそのまま"):
+                self.new(force=True)
+        finally:
+            ldhdd._IS_WINDOWS, ldhdd._windows_move = orig
+        self.assertEqual(read(path), b"keep")
+        self.assertEqual(os.listdir(self.dir), ["n.vhd"])
+
+    def test_cleanup_failure_is_reported(self):
+        orig_w, orig_rm = ldhdd._write_all, ldhdd.os.remove
+        calls = []
+
+        def fail(f, d):
+            calls.append(1)
+            if len(calls) == 2:
+                raise OSError(5, "injected")
+            return orig_w(f, d)
+
+        def norm(p):
+            raise OSError(30, "Read-only file system")
+        ldhdd._write_all, ldhdd.os.remove = fail, norm
+        try:
+            with self.assertRaisesRegex(ldhdd.LdhddError, "消せませんでした") as cm:
+                self.new()
+        finally:
+            ldhdd._write_all, ldhdd.os.remove = orig_w, orig_rm
+        self.assertIn("injected", str(cm.exception))
+        self.assertNotIn("何も残していません", str(cm.exception))
+
+    def test_info_bpb_larger_than_partition(self):
+        path, lay = self.new("b.vhd", "2M")
+        with open(path, "r+b") as f:
+            f.seek(128 * 512 + 19)
+            f.write(b"\0\0")
+            f.seek(128 * 512 + 32)
+            f.write(struct.pack("<I", 261632))  # 127.75MB を名乗る
+        run_main(["info", path])
+        self.assertIn("パーティション", run_main.out)
+        self.assertIn("を越えています", run_main.out)
+        self.assertNotIn("127.", run_main.out)
+
+    def test_info_label_needs_signature_and_is_sanitized(self):
+        path, lay = self.new("l.vhd", "2M", label="ABC")
+        with open(path, "r+b") as f:
+            f.seek(128 * 512 + 43)
+            f.write(b"A\x1b[2JB")
+        run_main(["info", path])
+        self.assertIn("ラベル A?[2JB", run_main.out)
+        self.assertNotIn("\x1b", run_main.out)
+        with open(path, "r+b") as f:
+            f.seek(128 * 512 + 38)
+            f.write(b"\x00")
+        run_main(["info", path])
+        self.assertIn("ラベル (なし)", run_main.out)
+
+    @unittest.skipUnless(shutil.which("fsck.fat"), "fsck.fat が無い")
+    def test_fsck_fat(self):
+        import subprocess
+        for size in ("1M", "16M", "16448K", "128M"):
+            path, lay = self.new("f%s.vhd" % size, size, label="TEST")
+            data = read(path)
+            part = os.path.join(self.dir, "part.img")
+            with open(part, "wb") as f:
+                f.write(data[128 * 512:len(data) - 512])
+            r = subprocess.run([shutil.which("fsck.fat"), "-n", part], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            self.assertEqual(r.returncode, 0, (size, r.stdout))
+
+    def test_existing_and_force(self):
+        path = os.path.join(self.dir, "n.vhd")
+        with open(path, "wb") as f:
+            f.write(b"keep")
+        with self.assertRaisesRegex(ldhdd.LdhddError, "既にあります"):
+            self.new()
+        self.assertEqual(read(path), b"keep")
+        self.new(force=True)
+        self.assertEqual(os.path.getsize(path), (16 << 20) + 512)
+        self.assertEqual(sorted(os.listdir(self.dir)), ["n.vhd"])
+
+    def test_same_file_as_input(self):
+        for opt in ("--ldsys", "--ld-bin", "--hdd-com"):
+            p = os.path.join(self.dir, "in" + opt.strip("-").replace("-", "") + ".bin")
+            if opt == "--ldsys":
+                src = read(MKLDHD)
+            elif opt == "--ld-bin":
+                src = self.ld
+            else:
+                src = self.com
+            with open(p, "wb") as f:
+                f.write(src)
+            args = ["new", p, "--size", "16M", "--force", opt, p]
+            if opt == "--ldsys":
+                # MKLDHD.d88 の LD.BIN は合体版なので、素の LD.BIN は別に渡す (HDD.COM は p から取る)
+                raw = os.path.join(self.dir, "raw.bin")
+                with open(raw, "wb") as f:
+                    f.write(self.ld)
+                args += ["--ld-bin", raw]
+            else:
+                args += ["--ldsys", MKLDHD]
+                if opt == "--hdd-com":
+                    raw = os.path.join(self.dir, "raw.bin")
+                    with open(raw, "wb") as f:
+                        f.write(self.ld)
+                    args += ["--ld-bin", raw]
+            self.assertEqual(run_main(args), 1, opt)
+            self.assertIn("同じファイル", run_main.err)
+            self.assertEqual(read(p), src)
+
+    def test_input_errors_create_nothing(self):
+        bad = inputs_from(b"\xff" * 100, self.com)
+        with self.assertRaises(ldhdd.LdhddError):
+            self.new(inputs=bad)
+        with self.assertRaises(ldhdd.LdhddError):
+            self.new(label="BAD*")
+        with self.assertRaises(ldhdd.LdhddError):
+            self.new(size="1M", fat="16")
+        self.assertEqual(os.listdir(self.dir), [])
+
+    def test_failures_leave_nothing(self):
+        orig = ldhdd._write_all
+        for exc in (OSError(5, "I/O error"), KeyboardInterrupt()):
+            calls = []
+
+            def fail(f, d, exc=exc):
+                calls.append(1)
+                if len(calls) == 2:
+                    raise exc
+                return orig(f, d)
+            ldhdd._write_all = fail
+            try:
+                with self.assertRaises((ldhdd.LdhddError, KeyboardInterrupt)):
+                    self.new()
+            finally:
+                ldhdd._write_all = orig
+            self.assertEqual(os.listdir(self.dir), [], exc)
+        # --force: 元のファイルはそのまま、仮ファイルも残らない
+        path = os.path.join(self.dir, "n.vhd")
+        with open(path, "wb") as f:
+            f.write(b"keep")
+        calls = []
+
+        def fail2(f, d):
+            calls.append(1)
+            if len(calls) == 2:
+                raise OSError(5, "I/O error")
+            return orig(f, d)
+        ldhdd._write_all = fail2
+        try:
+            with self.assertRaisesRegex(ldhdd.LdhddError, "元のファイルはそのまま"):
+                self.new(force=True)
+        finally:
+            ldhdd._write_all = orig
+        self.assertEqual(read(path), b"keep")
+        self.assertEqual(os.listdir(self.dir), ["n.vhd"])
+
+    def test_dir_fsync_failure_after_commit(self):
+        orig = ldhdd._fsync_dir
+
+        def fail(p):
+            raise OSError(5, "I/O error")
+        for force in (True, False):
+            path = os.path.join(self.dir, "n.vhd")
+            if force:
+                with open(path, "wb") as f:
+                    f.write(b"old")
+            elif os.path.exists(path):
+                os.remove(path)
+            ldhdd._fsync_dir = fail
+            try:
+                with self.assertRaisesRegex(ldhdd.LdhddError, "置かれましたが"):
+                    self.new(force=force)
+            finally:
+                ldhdd._fsync_dir = orig
+            self.assertEqual(os.path.getsize(path), (16 << 20) + 512, force)
+            run_main(["info", path])
+            self.assertIn("起動部    : あり", run_main.out)
+            self.assertEqual(sorted(os.listdir(self.dir)), ["n.vhd"])
+
+    def test_cli(self):
+        path = os.path.join(self.dir, "c.vhd")
+        p_ld = os.path.join(self.dir, "LD.BIN")
+        with open(p_ld, "wb") as f:
+            f.write(fake_ld_bin(fill=0x33))
+        self.assertEqual(run_main(["new", path, "--size", "2M", "--ldsys", MKLDHD, "--ld-bin", p_ld, "--label", "x"]), 0)
+        self.assertIn("を作りました", run_main.out)
+        self.assertIn("ラベル X", run_main.out)
+        with open(path, "rb") as f:
+            f.seek(0x200)
+            self.assertEqual(f.read(135 + 1254 + 9728)[135:135 + 1254], ldhdd.files_from_d88(MKLDHD)["HDD.COM"])
+        before = sha(path)
+        self.assertEqual(run_main(["new", path, "--size", "2M", "--ldsys", MKLDHD, "--ld-bin", p_ld]), 1)
+        self.assertIn("既にあります", run_main.err)
+        self.assertEqual(sha(path), before)
 
 
 @unittest.skipUnless(os.environ.get("LDHDD_LDSYS"), "LDHDD_LDSYS が無い")
