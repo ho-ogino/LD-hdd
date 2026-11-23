@@ -343,16 +343,23 @@ class SysLayout(NamedTuple):
     stub_len: int
 
 
-def makesys(ld_bin: bytes, com: bytes, unit: int = 0, drive: int = STUB_DRIVE) -> bytes:
-    """MAKESYS com out と同じ合体版 LD.BIN を作る。
-    drive はスタブの DRIVE 値 (既定 0x20 = 今の MAKESYS と同じ。分解した物の作り直し用)"""
+def makesys(ld_bin: bytes, com: bytes, unit: int = 0) -> bytes:
+    """MAKESYS com out と同じ合体版 LD.BIN を新しく作る"""
     ld = parse_msx_bin(ld_bin)
-    if len(com) < 1:
-        raise LdhddError("COM が空です")
     # スタブは LD.BIN の初期化の CALL (exec+6) の飛び先 (exec+7, +8) を差し替える
     hook = 7 + (ld.exec + 6 - ld.top)
     if ld.exec + 9 > ld.end or ld_bin[hook] != 0xCD:
         raise LdhddError("LD.BIN の実行番地 %04X の 6 バイト先に CALL (CD) がありません。MAKESYS が対応している LD.BIN ではありません" % ld.exec)
+    return assemble_sys(ld_bin, com, unit)
+
+
+def assemble_sys(ld_bin: bytes, com: bytes, unit: int = 0, drive: int = STUB_DRIVE) -> bytes:
+    """合体版 LD.BIN を組み立てる (新しく作る時は makesys を使う)。
+    既にある起動部を見分ける時の作り直しにも使うので、LD.BIN の中身の検査はここではしない。
+    drive はスタブの DRIVE 値 (既定 0x20 = 今の MAKESYS と同じ)"""
+    ld = parse_msx_bin(ld_bin)
+    if len(com) < 1:
+        raise LdhddError("COM が空です")
     stub, tss_pos, drive_pos = build_stub(unit)
     s = len(stub)
     c = len(com)
@@ -412,7 +419,7 @@ def parse_sys(sys_bin: bytes) -> SysInfo:
             com = sys_bin[s:s + c]
             ld_bin = sys_bin[s + c:]
             try:
-                rebuilt = makesys(ld_bin, com, unit, drive=cand[drive_pos])
+                rebuilt = assemble_sys(ld_bin, com, unit, drive=cand[drive_pos])
             except LdhddError:
                 continue
             # 外側のヘッダ・スタブの番地・中の LD.BIN のヘッダがすべて噛み合っていること
@@ -499,9 +506,10 @@ def check_fat_bpb(sec: bytes, part_sectors: int, read_part=None) -> None:
     if (res + nf * spf) * k > 0xFFFF or tot >= (1 << 24):
         raise LdhddError("第 1 パーティションの BPB: FAT か総セクタ数が大きすぎます")
     data_start = res + nf * spf + dir_secs
-    # BPB2DPB はデータ領域の位置 (DIRPS + DIRSCNT) を 16 ビットで計算し、
-    # DPB_14_ADDCL16 = データ領域の位置 - 2 クラスタ も 16 ビット (2048 バイトのセクタではどちらも倍にされる)
-    if not (data_start * k <= 0xFFFF and 0 <= (data_start - 2 * spc) * k <= 0xFFFF):
+    # BPB2DPB はデータ領域の位置 (DIRPS + DIRSCNT) を元のセクタ単位・16 ビットで計算する。
+    # DPB_14_ADDCL16 = データ領域の位置 - 2 クラスタ は 16 ビットの欄で、2048 バイトのセクタでは倍にされる
+    # (倍にされる DIRPS・DIRSCNT は上で確かめた)
+    if not (data_start <= 0xFFFF and 0 <= (data_start - 2 * spc) * k <= 0xFFFF):
         raise LdhddError("第 1 パーティションの BPB: データ領域の位置 (%d セクタ) が HDD.COM の DPB に入りません" % data_start)
     clusters = (tot - data_start) // spc if tot > data_start else 0
     if not 1 <= clusters < 65525:
@@ -755,7 +763,7 @@ def make_backup(f, path: str) -> str:
             shutil.copyfileobj(f, out, 1024 * 1024)
             out.flush()
             os.fsync(out.fileno())
-        _publish_no_replace(tmp, dst)
+        leftover = _publish_no_replace(tmp, dst)
         tmp = None
     except OSError as e:
         if tmp is not None:
@@ -764,25 +772,31 @@ def make_backup(f, path: str) -> str:
             except OSError:
                 pass
         raise LdhddError("バックアップを作れませんでした (%s)。何も書き込んでいません" % e)
+    if leftover:
+        # 正式な名前のバックアップはできている。仮の名前が消せなかっただけ
+        print("注意: 仮ファイル %s を消せませんでした (バックアップ %s はできています)" % (leftover, dst), file=sys.stderr)
     return dst
 
 
-def _publish_no_replace(tmp: str, dst: str) -> None:
-    """tmp を dst という名前にする。dst が既にあれば失敗する (置き換えない)"""
+def _publish_no_replace(tmp: str, dst: str) -> Optional[str]:
+    """tmp を dst という名前にする。dst が既にあれば失敗する (置き換えない)。
+    置き換えない方法が使えないファイルシステムでは、置き換えの危険がある方法には逃げずに失敗する。
+    正式な名前を付けた後に仮の名前を消せなかった時は、その仮の名前を返す (失敗にはしない)。"""
     if os.name == "nt":
         os.rename(tmp, dst)  # Windows の rename は既にある名前には失敗する
-        return
+        return None
     try:
         os.link(tmp, dst)  # 既にある名前には失敗する
     except OSError as e:
-        if e.errno not in (errno.EPERM, errno.EOPNOTSUPP, errno.ENOTSUP, errno.EXDEV, errno.EMLINK):
-            raise
-        # ハードリンクが使えないファイルシステム: 名前を確かめてから rename
-        if os.path.exists(dst):
-            raise OSError("バックアップの名前 %s が既にあります" % dst)
-        os.rename(tmp, dst)
-        return
-    os.remove(tmp)
+        if e.errno in (errno.EPERM, errno.EOPNOTSUPP, errno.ENOTSUP, errno.EXDEV, errno.EMLINK):
+            raise OSError(e.errno, "このファイルシステムでは、既にある物を置き換えずにバックアップを置けません"
+                                   " (自分でコピーを取ってから --no-backup を付けてください)")
+        raise
+    try:
+        os.remove(tmp)
+    except OSError:
+        return tmp
+    return None
 
 
 def _lock_windows(f, msvcrt_mod):

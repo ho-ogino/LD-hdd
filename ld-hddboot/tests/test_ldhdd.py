@@ -713,6 +713,83 @@ class TestUpdate(unittest.TestCase):
         self.assertEqual(read(stray), b"keep")
         self.assertEqual(sorted(os.listdir(self.dir)), ["t.vhd", "t.vhd.taken.bak", "t.vhd.taken.bak.part"])
 
+    def test_tagged_payload_without_call_is_replaceable(self):
+        # 以前の版 (CALL を確かめていなかった) が書いて印を付けた起動部も、前の起動部として扱う
+        ld = bytearray(fake_ld_bin(top=0xE000, body_len=0x1000))
+        ld[7 + 7 + 6] = 0x00
+        old = ldhdd.assemble_sys(bytes(ld), self.com)
+        v = self.vhd()
+        with open(v, "r+b") as f:
+            mbr = f.read(512)
+            f.seek(0)
+            f.write(ldhdd.boot_record(mbr, old) + old)
+            f.seek(0)
+            head = f.read(0xF000)
+        self.assertEqual(ldhdd.existing_boot(head), ldhdd.ExistingBoot(True, len(old)))
+        tiny = fake_ld_bin(top=0xE800, body_len=0x800)
+        self.quiet_update(v, inputs_from(tiny, self.com), backup=False)
+        n_new = 0x200 + len(ldhdd.makesys(tiny, self.com))
+        self.assertEqual(read(v)[n_new:0x200 + len(old)], bytes(0x200 + len(old) - n_new))
+
+    @unittest.skipIf(os.name == "nt", "ハードリンクのテスト")
+    def test_backup_without_hardlink_stops(self):
+        import errno as _errno
+        v = self.vhd()
+        before = sha(v)
+        orig = ldhdd.os.link
+
+        def nolink(a, b):
+            raise OSError(_errno.EPERM, "Operation not permitted")
+        ldhdd.os.link = nolink
+        try:
+            with self.assertRaisesRegex(ldhdd.LdhddError, "置き換えずに"):
+                self.quiet_update(v)
+        finally:
+            ldhdd.os.link = orig
+        self.assertEqual(sha(v), before)
+        self.assertEqual(os.listdir(self.dir), ["t.vhd"])
+
+    @unittest.skipIf(os.name == "nt", "ハードリンクのテスト")
+    def test_backup_name_taken_during_publish(self):
+        v = self.vhd()
+        before = sha(v)
+        orig = ldhdd.os.link
+        taken = []
+
+        def racing_link(a, b):
+            with open(b, "wb") as f:  # 名前を付ける直前に、ほかの誰かが同じ名前を作る
+                f.write(b"other")
+            taken.append(b)
+            return orig(a, b)
+        ldhdd.os.link = racing_link
+        try:
+            with self.assertRaisesRegex(ldhdd.LdhddError, "バックアップを作れません"):
+                self.quiet_update(v)
+        finally:
+            ldhdd.os.link = orig
+        self.assertEqual(sha(v), before)
+        self.assertEqual(read(taken[0]), b"other")
+        self.assertEqual(sorted(os.listdir(self.dir)), sorted(["t.vhd", os.path.basename(taken[0])]))
+
+    @unittest.skipIf(os.name == "nt", "ハードリンクのテスト")
+    def test_backup_staging_cleanup_failure_is_not_fatal(self):
+        v = self.vhd()
+        orig = ldhdd.os.remove
+
+        def noremove(p):
+            if p.endswith(".part"):
+                raise OSError(13, "Permission denied")
+            return orig(p)
+        ldhdd.os.remove = noremove
+        err = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(err):
+                bak = self.quiet_update(v)
+        finally:
+            ldhdd.os.remove = orig
+        self.assertTrue(os.path.exists(bak))
+        self.assertIn("消せませんでした", err.getvalue())
+
     @unittest.skipIf(os.name == "nt", "flock のテスト")
     def test_locked_by_other_process(self):
         import subprocess
@@ -847,10 +924,12 @@ class TestDpbLimits(unittest.TestCase):
             data_start = 1 + 2 * spf + 512 * 32 // 2048
             return bpb_sector(data_start + 100, bps=2048, spc=1, root=512, spf=spf)
         big = 40000 * 4
-        # データ領域の位置 (1 + 2*spf + 8) を倍にして 16 ビットに収まるのは spf=16379 まで
-        self.check(bpb(16379), big)
+        # ADDCL16 = (データ領域の位置 - 2) を倍にして 16 ビットに収まるのは spf=16380 まで
+        self.check(bpb(16380), big)
         with self.assertRaisesRegex(ldhdd.LdhddError, "データ領域の位置"):
-            self.check(bpb(16380), big)
+            self.check(bpb(16381), big)
+        # 倍にする前のデータ領域の位置が 32768 で、倍にした後のルートの終わりが 65535 になる形は使える
+        self.check(bpb_sector(32768 + 100, bps=2048, spc=1, root=448, spf=16380), big)
 
     def test_root_dir_sectors(self):
         with self.assertRaisesRegex(ldhdd.LdhddError, "ルートディレクトリ"):
