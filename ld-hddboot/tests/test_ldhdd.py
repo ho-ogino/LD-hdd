@@ -734,22 +734,26 @@ class TestUpdate(unittest.TestCase):
         self.assertEqual(read(v)[n_new:0x200 + len(old)], bytes(0x200 + len(old) - n_new))
 
     @unittest.skipIf(os.name == "nt", "ハードリンクのテスト")
-    def test_backup_without_hardlink_stops(self):
+    def test_backup_without_hardlink_falls_back(self):
+        # ハードリンクが使えないファイルシステム (FAT など) でもバックアップを作れる。既にある名前は置き換えない
         import errno as _errno
         v = self.vhd()
-        before = sha(v)
-        orig = ldhdd.os.link
+        orig_link, orig_path = ldhdd.os.link, ldhdd._backup_path
 
         def nolink(a, b, **kw):
             raise OSError(_errno.EPERM, "Operation not permitted")
         ldhdd.os.link = nolink
         try:
-            with self.assertRaisesRegex(ldhdd.LdhddError, "置き換えずに"):
+            bak = self.quiet_update(v)
+            self.assertEqual(sorted(os.listdir(self.dir)), sorted(["t.vhd", os.path.basename(bak)]))
+            ldhdd._backup_path = lambda path: bak
+            before = sha(v)
+            with self.assertRaisesRegex(ldhdd.LdhddError, "バックアップを作れません"):
                 self.quiet_update(v)
+            self.assertEqual(sha(v), before)
         finally:
-            ldhdd.os.link = orig
-        self.assertEqual(sha(v), before)
-        self.assertEqual(os.listdir(self.dir), ["t.vhd"])
+            ldhdd.os.link, ldhdd._backup_path = orig_link, orig_path
+        self.assertEqual(sorted(os.listdir(self.dir)), sorted(["t.vhd", os.path.basename(bak)]))
 
     @unittest.skipIf(os.name == "nt", "ハードリンクのテスト")
     def test_backup_name_taken_during_publish(self):
@@ -777,19 +781,19 @@ class TestUpdate(unittest.TestCase):
     @unittest.skipIf(os.name == "nt", "ハードリンクのテスト")
     def test_backup_staging_cleanup_failure_is_not_fatal(self):
         v = self.vhd()
-        orig = ldhdd.os.unlink
+        orig = ldhdd.os.remove
 
-        def noremove(p, **kw):
+        def noremove(p):
             if str(p).endswith(".part"):
                 raise OSError(13, "Permission denied")
-            return orig(p, **kw)
-        ldhdd.os.unlink = noremove
+            return orig(p)
+        ldhdd.os.remove = noremove
         err = io.StringIO()
         try:
             with contextlib.redirect_stderr(err):
                 bak = self.quiet_update(v)
         finally:
-            ldhdd.os.unlink = orig
+            ldhdd.os.remove = orig
         self.assertTrue(os.path.exists(bak))
         self.assertIn("消せませんでした", err.getvalue())
 
@@ -836,36 +840,6 @@ class TestUpdate(unittest.TestCase):
         self.assertEqual(len(baks), 1)
         self.assertIn(baks[0], str(cm.exception))
 
-    @unittest.skipIf(os.name == "nt", "ディレクトリの記述子のテスト")
-    def test_backup_path_changed_is_detected(self):
-        # 親のパス (シンボリックリンク) が、名前を付けた後で別のディレクトリを指すようになったら、
-        # 表示する戻し先が今作ったバックアップではなくなるので、イメージに書かずに止める
-        real1 = os.path.join(self.dir, "real1")
-        real2 = os.path.join(self.dir, "real2")
-        os.mkdir(real1)
-        os.mkdir(real2)
-        make_vhd(os.path.join(real1, "t.vhd"))
-        link_dir = os.path.join(self.dir, "cur")
-        os.symlink(real1, link_dir)
-        v = os.path.join(link_dir, "t.vhd")
-        before = sha(v)
-        orig = ldhdd.os.link
-
-        def link(a, b, **kw):
-            r = orig(a, b, **kw)
-            with open(os.path.join(real2, b), "wb") as f:  # 新しい指す先に同じ名前の別の物
-                f.write(b"other")
-            os.unlink(link_dir)
-            os.symlink(real2, link_dir)
-            return r
-        ldhdd.os.link = link
-        try:
-            with self.assertRaisesRegex(ldhdd.LdhddError, "別の物を指しています"):
-                self.quiet_update(v)
-        finally:
-            ldhdd.os.link = orig
-        self.assertEqual(sha(os.path.join(real1, "t.vhd")), before)
-
     class FakeKernel32:
         """MoveFileExW の偽物。MOVEFILE_REPLACE_EXISTING (0x1) が立っていれば置き換える"""
         def __init__(self, after_move=None):
@@ -883,55 +857,20 @@ class TestUpdate(unittest.TestCase):
 
     def test_windows_backup_move(self):
         # Windows の名前付けは MoveFileExW(MOVEFILE_WRITE_THROUGH = 0x8 のみ。REPLACE_EXISTING = 0x1 は付けない)
-        v = self.vhd()
         k = self.FakeKernel32()
+        src = os.path.join(self.dir, "s.part")
         dst = os.path.join(self.dir, "w.bak")
-        with open(v, "rb") as f:
-            self.assertEqual(ldhdd._make_backup_windows(f, v, dst, kernel32=k), dst)
+        with open(src, "wb") as f:
+            f.write(b"data")
+        ldhdd._windows_move_no_replace(src, dst, kernel32=k)
         self.assertEqual(k.calls, [0x8])
-        self.assertEqual(read(dst), read(v))
-        # 既にある名前には失敗し (置き換えるフラグなら、ここで置き換わってテストが落ちる)、仮ファイルは残らない
-        with open(dst, "wb") as f:
-            f.write(b"keep")
-        with open(v, "rb") as f:
-            with self.assertRaises(ldhdd.LdhddError):
-                ldhdd._make_backup_windows(f, v, dst, kernel32=k)
-        self.assertEqual(read(dst), b"keep")
-        self.assertEqual(sorted(os.listdir(self.dir)), ["t.vhd", "w.bak"])
-
-    def test_windows_backup_path_changed(self):
-        # 名前を付けた後に、戻し先のパスが別の物を指すようになったら止める (親の付け替えの代わり)
-        def swap(dst):
-            os.replace(dst, dst + ".moved")
-            with open(dst, "wb") as f:
-                f.write(b"other")
-        v = self.vhd()
-        k = self.FakeKernel32(after_move=swap)
-        with open(v, "rb") as f:
-            with self.assertRaisesRegex(ldhdd.LdhddError, "別の物を指しています"):
-                ldhdd._make_backup_windows(f, v, os.path.join(self.dir, "w.bak"), kernel32=k)
-
-    @unittest.skipIf(os.name == "nt", "ハードリンクのテスト")
-    def test_backup_entry_replaced_after_link(self):
-        # 正式な名前を付けた直後に、その名前が別のファイルに置き換えられたら、イメージに書かずに止める
-        v = self.vhd()
-        before = sha(v)
-        orig = ldhdd.os.link
-
-        def link(a, b, **kw):
-            r = orig(a, b, **kw)
-            p = os.path.join(self.dir, b)
-            os.unlink(p)
-            with open(p, "wb") as f:
-                f.write(b"other")
-            return r
-        ldhdd.os.link = link
-        try:
-            with self.assertRaisesRegex(ldhdd.LdhddError, "別の物を指しています"):
-                self.quiet_update(v)
-        finally:
-            ldhdd.os.link = orig
-        self.assertEqual(sha(v), before)
+        self.assertEqual(read(dst), b"data")
+        # 既にある名前には失敗する (置き換えるフラグなら、ここで置き換わってテストが落ちる)
+        with open(src, "wb") as f:
+            f.write(b"new")
+        with self.assertRaises(OSError):
+            ldhdd._windows_move_no_replace(src, dst, kernel32=k)
+        self.assertEqual(read(dst), b"data")
 
     @unittest.skipIf(os.name == "nt", "シンボリックリンクのテスト")
     def test_backup_next_to_image_with_symlink_dotdot(self):
@@ -946,6 +885,7 @@ class TestUpdate(unittest.TestCase):
         self.assertEqual([x for x in os.listdir(a) if x.endswith(".bak")], [os.path.basename(bak)])
         self.assertEqual([x for x in os.listdir(self.dir) if x.endswith(".bak")], [])
 
+    @unittest.skipIf(os.name == "nt", "Windows はパス全体の長さの上限に先にかかる")
     def test_long_image_name(self):
         # 名前の長さの上限 (255 バイト) 近くの名前でも、仮ファイルの名前が長くなりすぎない
         name = "x" * 226 + ".vhd"
