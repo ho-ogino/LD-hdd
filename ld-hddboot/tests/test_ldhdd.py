@@ -1634,7 +1634,8 @@ class TestShortName(unittest.TestCase):
         self.assertEqual(ldhdd.to_short_name("readme.txt"), b"README  TXT")
         self.assertEqual(ldhdd.to_short_name("A"), b"A          ")
         self.assertEqual(ldhdd.to_short_name("ABCDEFGH.ABC"), b"ABCDEFGHABC")
-        for bad in ("ABCDEFGHI.TXT", "A.ABCD", "A.B.C", ".PROFILE", "A B.TXT", "A*B", "日本語.TXT", "", "A."):
+        for bad in ("ABCDEFGHI.TXT", "A.ABCD", "A.B.C", ".PROFILE", "A B.TXT", "A*B", "日本語.TXT", "", "A.",
+                    "straße", "\u017f"):
             with self.assertRaises(ldhdd.LdhddError, msg=bad):
                 ldhdd.to_short_name(bad)
 
@@ -1806,12 +1807,12 @@ class TestAdd(unittest.TestCase):
         path = self.vhd()
         self.put(os.path.join("P", "LONGFILENAME.TXT"), b"1")
         self.put(os.path.join("P", "OK.TXT"), b"2")
-        self.put(os.path.join("P", "BAD*.TXT"), b"3")
+        self.put(os.path.join("P", "BAD NAME.TXT"), b"3")
         before = sha(path)
         with self.assertRaises(ldhdd.LdhddError) as cm:
             self.add(path, [os.path.join(self.src, "P")])
         self.assertIn("LONGFILENAME.TXT", str(cm.exception))
-        self.assertIn("BAD*.TXT", str(cm.exception))
+        self.assertIn("BAD NAME.TXT", str(cm.exception))
         self.assertEqual(sha(path), before)
         self.put(os.path.join("Q", ".git", "HEAD"), b"x")
         self.put(os.path.join("Q", "OK.TXT"), b"ok")
@@ -1826,6 +1827,7 @@ class TestAdd(unittest.TestCase):
         if os.name != "nt":
             os.symlink(os.path.join(self.src, "Q"), os.path.join(self.src, "LNK"))
             self.assert_refused(path, [os.path.join(self.src, "LNK")], "シンボリックリンク")
+            self.assert_refused(path, [os.path.join(self.src, "LNK") + "/"], "シンボリックリンク")
 
     def test_dry_run_and_to(self):
         path = self.vhd()
@@ -1943,6 +1945,85 @@ class TestAdd(unittest.TestCase):
             self.assertEqual(ldhdd._read_at(f, slots[5], 1), b"\0")  # 印を置き直した
         run_main(["ls", path])
         self.assertNotIn("STALE", run_main.out)
+
+    def test_overwrite_entry_write_failure_keeps_original(self):
+        path = self.vhd()
+        self.add(path, [self.put("A.TXT", b"old" * 3000)])
+        p2 = os.path.join(self.dir, "n2", "A.TXT")
+        os.makedirs(os.path.dirname(p2))
+        with open(p2, "wb") as fh:
+            fh.write(b"new" * 5000)
+        orig = ldhdd._write_all
+
+        def fail(f, d):
+            if len(d) == 32:  # ディレクトリ項目の書き込み (FAT の後)
+                raise OSError(5, "injected")
+            return orig(f, d)
+        ldhdd._write_all = fail
+        try:
+            with self.assertRaisesRegex(ldhdd.LdhddError, "injected"):
+                self.add(path, [p2], overwrite=True)
+        finally:
+            ldhdd._write_all = orig
+        f, vol = self.open_vol(path)
+        try:
+            vol.walk_check()  # 古い鎖はまだ使用中で、持ち主も 1 つ
+            self.assertEqual(vol_read_file(vol, "/A.TXT"), b"old" * 3000)
+        finally:
+            f.close()
+
+    def test_overlapping_partitions_refused(self):
+        path = self.vhd()
+        with open(path, "r+b") as f:
+            f.seek(0x1CE)
+            f.write(struct.pack("<B3sB3sII", 0, b"\0\0\0", 0x06, b"\0\0\0", 200, 100))
+        self.assert_refused(path, [self.put("N.TXT")], "重なっています")
+
+    def test_source_size_change(self):
+        for change in (b"short", b"x" * 4099):
+            path = self.vhd(name="s%d.vhd" % len(change))
+            p = self.put("S%d.TXT" % len(change), b"y" * 4097)
+            orig = ldhdd.plan_add
+
+            def plan_then_change(*a, **kw):
+                r = orig(*a, **kw)
+                with open(p, "wb") as fh:
+                    fh.write(change)
+                return r
+            ldhdd.plan_add = plan_then_change
+            try:
+                self.assert_refused(path, [p], "調べた後で")
+            finally:
+                ldhdd.plan_add = orig
+
+    def test_long_name_conflict(self):
+        path = self.vhd()
+        self.add(path, [self.put("README~1.TXT", b"r")])
+        short = b"README~1TXT"
+        lname = "ReadMe.txt"
+        units = [ord(c) for c in lname] + [0] + [0xFFFF] * (13 - len(lname) - 1)
+        e = bytearray(32)
+        e[0] = 0x41
+        e[11] = 0x0F
+        e[13] = ldhdd._lfn_checksum(short)
+        b = struct.pack("<13H", *units)
+        e[1:11], e[14:26], e[28:32] = b[0:10], b[10:22], b[22:26]
+        with open(path, "r+b") as f:
+            vol = ldhdd.FatVolume(f)
+            listing = vol.read_dir(0)
+            ent = vol.find(listing, short)
+            raw = ldhdd._read_at(f, ent.off, 32)
+            i = listing.slots.index(ent.off)
+            # [i] に長い名前、[i+1] に短い名前の項目を置き直す
+            f.seek(listing.slots[i])
+            f.write(bytes(e))
+            f.seek(listing.slots[i + 1])
+            f.write(raw)
+        with open(path, "rb") as f:
+            vol = ldhdd.FatVolume(f)
+            self.assertEqual(vol.find(vol.read_dir(0), short).long_name, "ReadMe.txt")
+        self.assert_refused(path, [self.put(os.path.join("n", "README.TXT"), b"x")], "長い名前")
+        self.assert_refused(path, [self.put(os.path.join("n", "README.TXT"), b"x")], "長い名前", overwrite=True)
 
     def test_timestamps(self):
         path = self.vhd()

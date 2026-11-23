@@ -1341,7 +1341,7 @@ DOTDOT_NAME = b"..         "
 def to_short_name(name: str) -> bytes:
     """ホストの名前を 8.3 の 11 バイトにする (英小文字は大文字に)。合わなければ LdhddError"""
     try:
-        raw = name.upper().encode("ascii")
+        raw = name.encode("ascii").upper()
     except UnicodeEncodeError:
         raise LdhddError("%s: ASCII 以外の文字は使えません" % name)
     if not raw or raw.startswith(b"."):
@@ -1373,6 +1373,38 @@ def short_to_text(name11: bytes) -> str:
     return "".join(chr(c) if 0x20 <= c < 0x7F else "?" for c in text)
 
 
+def _lfn_checksum(name11: bytes) -> int:
+    s = 0
+    for b in name11:
+        s = (((s & 1) << 7) + (s >> 1) + b) & 0xFF
+    return s
+
+
+def _long_name(parts: List[bytes], name11: bytes) -> Optional[str]:
+    """短い名前の項目の直前の長い名前の項目から、長い名前を組み立てる (並びとチェックサムが合う時だけ)"""
+    if not parts or not parts[0][0] & 0x40:
+        return None
+    n = parts[0][0] & 0x1F
+    if n != len(parts) or any((p[0] & 0x1F) != n - i for i, p in enumerate(parts)):
+        return None
+    ck = _lfn_checksum(name11)
+    if any(p[13] != ck for p in parts):
+        return None
+    units = b""
+    for p in reversed(parts):
+        units += p[1:11] + p[14:26] + p[28:32]
+    chars = []
+    for i in range(0, len(units), 2):
+        u = units[i] | (units[i + 1] << 8)
+        if u in (0x0000, 0xFFFF):
+            break
+        chars.append(u)
+    try:
+        return struct.pack("<%dH" % len(chars), *chars).decode("utf-16-le")
+    except UnicodeDecodeError:
+        return None
+
+
 def _dos_datetime(ts: float) -> Tuple[int, int]:
     t = time.localtime(ts)
     if t.tm_year < 1980:
@@ -1400,6 +1432,7 @@ class DirEntry(NamedTuple):
     off: int  # イメージの中の項目の位置
     mtime: int
     mdate: int
+    long_name: Optional[str] = None  # VFAT の長い名前 (チェックサムが合う物だけ)
 
     @property
     def is_dir(self) -> bool:
@@ -1429,6 +1462,9 @@ class FatVolume:
         if p1.lba < 1 or p1.count < 1 or (p1.lba + p1.count) * SECTOR > vk.data_size:
             raise LdhddError("第 1 パーティションの範囲がおかしい (LBA %d から %d セクタ、データは %d バイト)"
                              % (p1.lba, p1.count, vk.data_size))
+        for p in read_partitions(mbr)[1:]:
+            if p.ptype and p.lba < p1.lba + p1.count and p1.lba < p.lba + p.count:
+                raise LdhddError("第 1 パーティションがパーティション %d と重なっています" % p.index)
         self.base = p1.lba * SECTOR
         self.part_end = (p1.lba + p1.count) * SECTOR
         bpb = _read_at(f, self.base, SECTOR)
@@ -1521,6 +1557,7 @@ class FatVolume:
                     chunks.append(raw[i * 32:i * 32 + 32])
         entries, free = [], []
         end_index = None
+        lfn: List[bytes] = []  # 直前に続いている長い名前の項目
         for i, (off, e) in enumerate(zip(offs, chunks)):
             if end_index is not None:
                 free.append(off)
@@ -1531,14 +1568,23 @@ class FatVolume:
                 continue
             if e[0] == 0xE5:
                 free.append(off)
+                lfn = []
                 continue
             attr = e[11]
-            if attr == 0x0F or attr & 0x08:  # 長い名前の項目・ボリュームラベル: 場所は使用中、中身としては扱わない
+            if attr == 0x0F:  # 長い名前の項目: 場所は使用中。次の短い名前の項目と組みにする
+                if e[0] & 0x40:
+                    lfn = []
+                lfn.append(bytes(e))
+                continue
+            if attr & 0x08:  # ボリュームラベル: 場所は使用中、中身としては扱わない
+                lfn = []
                 continue
             name = bytes(e[0:11])
+            long_name = _long_name(lfn, name)
+            lfn = []
             if name in (DOT_NAME, DOTDOT_NAME):
                 continue
-            entries.append(DirEntry(name, attr, _u16(e, 26), _u32(e, 28), off, _u16(e, 22), _u16(e, 24)))
+            entries.append(DirEntry(name, attr, _u16(e, 26), _u32(e, 28), off, _u16(e, 22), _u16(e, 24), long_name))
         return DirListing(cluster, offs, entries, free, end_index)
 
     def walk_check(self) -> None:
@@ -1582,6 +1628,14 @@ class FatVolume:
                 return e
         return None
 
+    def long_name_conflict(self, listing: DirListing, name11: bytes) -> Optional[DirEntry]:
+        """短い名前は違うが、長い名前 (大文字小文字を区別しない) が同じになる物"""
+        text = short_to_text(name11).casefold()
+        for e in listing.entries:
+            if e.name != name11 and e.long_name is not None and e.long_name.casefold() == text:
+                return e
+        return None
+
     def resolve_dir(self, path: str) -> int:
         """「/A/B」のフォルダのクラスタ (ルートは 0)。無ければ LdhddError"""
         cl = 0
@@ -1609,7 +1663,7 @@ def scan_host(paths: List[str], skip_dotfiles: bool) -> Tuple[List[HostNode], Li
     errors, skipped = [], []
 
     def node(path: str, name: str, top: bool) -> Optional[HostNode]:
-        if os.path.islink(path):
+        if os.path.islink(path.rstrip("/\\") or path):
             errors.append("%s: シンボリックリンクは入れられません" % path)
             return None
         if name.startswith(".") and not top and skip_dotfiles:
@@ -1684,6 +1738,9 @@ def plan_add(vol: FatVolume, nodes: List[HostNode], to_path: str, overwrite: boo
         if target[0] == "existing":
             listing = vol.read_dir(target[1], shown)
             e = vol.find(listing, n11)
+            lc = vol.long_name_conflict(listing, n11)
+            if e is None and lc is not None:
+                raise LdhddError("%s: VHD に長い名前「%s」の物があり、同じ名前になります" % (shown, lc.long_name))
             if e is not None:
                 if not e.is_dir:
                     raise LdhddError("%s はファイルです (フォルダではありません)" % shown)
@@ -1699,7 +1756,12 @@ def plan_add(vol: FatVolume, nodes: List[HostNode], to_path: str, overwrite: boo
         p = dest_path.rstrip("/") + "/" + short_to_text(node.name11)
         existing = None
         if dest[0] == "existing":
-            existing = vol.find(vol.read_dir(dest[1], dest_path), node.name11)
+            listing = vol.read_dir(dest[1], dest_path)
+            existing = vol.find(listing, node.name11)
+            lc = vol.long_name_conflict(listing, node.name11)
+            if existing is None and lc is not None:
+                errors.append("%s: VHD に長い名前「%s」の物があり、同じ名前になります" % (p, lc.long_name))
+                return
         if node.is_dir:
             if existing is not None:
                 if not existing.is_dir:
@@ -1822,11 +1884,19 @@ def execute_add(vol: FatVolume, plan: AddPlan) -> None:
         node = item.node
         cs = alloc(_ceil(node.size, vol.csize))
         with open(node.path, "rb") as src:
+            left = node.size
             for c in cs:
-                chunk = src.read(vol.csize)
+                want = min(left, vol.csize)
+                chunk = b""
+                while len(chunk) < want:
+                    b = src.read(want - len(chunk))
+                    if not b:
+                        raise LdhddError("%s: 調べた後で小さくなりました (書き込む前に止めました)" % node.path)
+                    chunk += b
+                left -= want
                 data_writes.append((vol.cluster_off(c), chunk.ljust(vol.csize, b"\0")))
             if src.read(1):
-                raise LdhddError("%s: 読んでいる間に大きくなりました" % node.path)
+                raise LdhddError("%s: 調べた後で大きくなりました (書き込む前に止めました)" % node.path)
         return (cs[0] if cs else 0), node.size
 
     def build_new_dir(nd: NewDir, parent_cluster: int) -> None:
@@ -1901,22 +1971,29 @@ def execute_add(vol: FatVolume, plan: AddPlan) -> None:
             if nxt not in entry_writes:
                 entry_writes[nxt] = b"\0" + _read_at(f, nxt + 1, 31)
 
-    for c in freed:
-        vol.set(c, 0)
+    def write_fats() -> None:
+        for k in range(vol.nfats):
+            f.seek(vol.fat_off + k * vol.fat_bytes)
+            _write_all(f, bytes(vol.fat))
 
     # 1. データ
     for off, data in data_writes:
         f.seek(off)
         _write_all(f, data)
-    # 2. FAT (全部の写し)
-    for k in range(vol.nfats):
-        f.seek(vol.fat_off + k * vol.fat_bytes)
-        _write_all(f, bytes(vol.fat))
+    # 2. FAT (全部の写し)。置き換える前のファイルの鎖は、まだ使用中のまま
+    write_fats()
+    os.fsync(f.fileno())
     # 3. ディレクトリ項目
     for off in sorted(entry_writes):
         f.seek(off)
         _write_all(f, entry_writes[off])
     os.fsync(f.fileno())
+    # 4. 新しい項目が確かに書けてから、置き換えた前のファイルの鎖を空きに戻す
+    if freed:
+        for c in freed:
+            vol.set(c, 0)
+        write_fats()
+        os.fsync(f.fileno())
     # 読み戻し
     for k in range(vol.nfats):
         if _read_at(f, vol.fat_off + k * vol.fat_bytes, vol.fat_bytes) != bytes(vol.fat):
