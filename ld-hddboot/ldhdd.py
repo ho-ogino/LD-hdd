@@ -26,6 +26,7 @@ import io
 import os
 import re
 import shutil
+import stat
 import struct
 import sys
 import time
@@ -1445,6 +1446,7 @@ class DirListing(NamedTuple):
     entries: List[DirEntry]  # ふつうのファイル・フォルダ
     free: List[int]  # 使える項目の位置 (E5h の所と、終わりの印から後ろ)
     end_index: Optional[int]  # 終わりの印 (00h) の項目の番号 (無ければ None)
+    detached: Dict[int, List[int]] = {}  # 空きの位置 → その直前に宙に浮いている長い名前の項目の位置
 
 
 class FatVolume:
@@ -1558,34 +1560,39 @@ class FatVolume:
         entries, free = [], []
         end_index = None
         lfn: List[bytes] = []  # 直前に続いている長い名前の項目
+        lfn_offs: List[int] = []
+        detached: Dict[int, List[int]] = {}
         for i, (off, e) in enumerate(zip(offs, chunks)):
             if end_index is not None:
                 free.append(off)
                 continue
-            if e[0] == 0x00:
-                end_index = i
+            if e[0] in (0x00, 0xE5):
+                if lfn_offs:
+                    # 短い名前の項目と組になっていない長い名前の項目の直後の空き。
+                    # ここに新しい項目を置くと、その長い名前が付いてしまう
+                    detached[off] = list(lfn_offs)
+                lfn, lfn_offs = [], []
+                if e[0] == 0x00:
+                    end_index = i
                 free.append(off)
-                continue
-            if e[0] == 0xE5:
-                free.append(off)
-                lfn = []
                 continue
             attr = e[11]
             if attr == 0x0F:  # 長い名前の項目: 場所は使用中。次の短い名前の項目と組みにする
                 if e[0] & 0x40:
-                    lfn = []
+                    lfn, lfn_offs = [], []
                 lfn.append(bytes(e))
+                lfn_offs.append(off)
                 continue
             if attr & 0x08:  # ボリュームラベル: 場所は使用中、中身としては扱わない
-                lfn = []
+                lfn, lfn_offs = [], []
                 continue
             name = bytes(e[0:11])
             long_name = _long_name(lfn, name)
-            lfn = []
+            lfn, lfn_offs = [], []
             if name in (DOT_NAME, DOTDOT_NAME):
                 continue
             entries.append(DirEntry(name, attr, _u16(e, 26), _u32(e, 28), off, _u16(e, 22), _u16(e, 24), long_name))
-        return DirListing(cluster, offs, entries, free, end_index)
+        return DirListing(cluster, offs, entries, free, end_index, detached)
 
     def walk_check(self) -> None:
         """木全体をたどり、クラスタの持ち主が 1 つずつであること、フォルダが祖先を指さないこと、
@@ -1656,6 +1663,21 @@ class HostNode(NamedTuple):
     size: int
     mtime: float
     children: List["HostNode"]
+    ident: Tuple[int, int] = (0, 0)  # 調べた時のファイルの (st_dev, st_ino)
+
+
+def _final_component_path(path: str) -> str:
+    """末尾の区切りと「/.」を取り除いたパス (親のたどり方は変えない)。シンボリックリンクの判定に使う"""
+    p = path
+    while True:
+        q = p.rstrip("/\\")
+        if q and q != p:
+            p = q
+            continue
+        if p.endswith(("/.", "\\.")) and len(p) > 2:
+            p = p[:-2]
+            continue
+        return p or path
 
 
 def scan_host(paths: List[str], skip_dotfiles: bool) -> Tuple[List[HostNode], List[str], List[str]]:
@@ -1663,11 +1685,11 @@ def scan_host(paths: List[str], skip_dotfiles: bool) -> Tuple[List[HostNode], Li
     errors, skipped = [], []
 
     def node(path: str, name: str, top: bool) -> Optional[HostNode]:
-        if os.path.islink(path.rstrip("/\\") or path):
-            errors.append("%s: シンボリックリンクは入れられません" % path)
-            return None
         if name.startswith(".") and not top and skip_dotfiles:
             skipped.append(path)
+            return None
+        if os.path.islink(_final_component_path(path)):
+            errors.append("%s: シンボリックリンクは入れられません" % path)
             return None
         try:
             name11 = to_short_name(name)
@@ -1690,7 +1712,8 @@ def scan_host(paths: List[str], skip_dotfiles: bool) -> Tuple[List[HostNode], Li
         if not os.path.isfile(path):
             errors.append("%s: ふつうのファイルでもフォルダでもありません" % path)
             return None
-        return None if name11 is None else HostNode(name11, path, False, st.st_size, st.st_mtime, [])
+        return None if name11 is None else HostNode(name11, path, False, st.st_size, st.st_mtime, [],
+                                                    (st.st_dev, st.st_ino))
 
     nodes = []
     for p in paths:
@@ -1883,7 +1906,12 @@ def execute_add(vol: FatVolume, plan: AddPlan) -> None:
     def write_file(item: NewFile) -> Tuple[int, int]:
         node = item.node
         cs = alloc(_ceil(node.size, vol.csize))
-        with open(node.path, "rb") as src:
+        fd = os.open(node.path, os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0))
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or (node.ident[1] and (st.st_dev, st.st_ino) != node.ident):
+            os.close(fd)
+            raise LdhddError("%s: 調べた後で別の物に置き換わりました (書き込む前に止めました)" % node.path)
+        with os.fdopen(fd, "rb") as src:
             left = node.size
             for c in cs:
                 want = min(left, vol.csize)
@@ -1923,12 +1951,27 @@ def execute_add(vol: FatVolume, plan: AddPlan) -> None:
     slots_by_dir: Dict[int, List[int]] = {}
     marker_by_dir: Dict[int, Optional[int]] = {}
 
-    def take_slot(cl: int) -> int:
+    detached_by_dir: Dict[int, Dict[int, List[int]]] = {}
+    inval_writes: Dict[int, bytes] = {}
+
+    def ensure_listing(cl: int) -> None:
         if cl not in slots_by_dir:
             listing = vol.read_dir(cl)
             slots_by_dir[cl] = list(listing.free)
             marker_by_dir[cl] = listing.slots[listing.end_index] if listing.end_index is not None else None
             slots_by_dir[(cl, "all")] = listing.slots
+            detached_by_dir[cl] = listing.detached
+
+    def take_slot(cl: int) -> int:
+        ensure_listing(cl)
+        slot = _take_slot_raw(cl)
+        # 宙に浮いた長い名前の項目の直後なら、先にその項目を消した印 (E5h) にする
+        for lo in detached_by_dir[cl].get(slot, []):
+            if lo not in inval_writes:
+                inval_writes[lo] = b"\xe5" + _read_at(f, lo + 1, 31)
+        return slot
+
+    def _take_slot_raw(cl: int) -> int:
         if not slots_by_dir[cl]:
             # フォルダの鎖を 1 クラスタ伸ばす (0 で埋める)
             last = vol.chain(cl, "フォルダ")[-1]
@@ -1951,6 +1994,7 @@ def execute_add(vol: FatVolume, plan: AddPlan) -> None:
             new_cl, size = write_file(item)
             ent = make_dir_entry(item.node.name11, 0x20, new_cl, size, item.node.mtime)
             if existing is not None:
+                ensure_listing(cl)
                 if existing.cluster:
                     freed.extend(vol.chain(existing.cluster, short_to_text(existing.name)))
                 entry_writes[existing.off] = ent
@@ -1983,12 +2027,48 @@ def execute_add(vol: FatVolume, plan: AddPlan) -> None:
     # 2. FAT (全部の写し)。置き換える前のファイルの鎖は、まだ使用中のまま
     write_fats()
     os.fsync(f.fileno())
-    # 3. ディレクトリ項目
-    for off in sorted(entry_writes):
-        f.seek(off)
-        _write_all(f, entry_writes[off])
-    os.fsync(f.fileno())
-    # 4. 新しい項目が確かに書けてから、置き換えた前のファイルの鎖を空きに戻す
+    # 3. ディレクトリ項目。並べ方はディレクトリの中の順。
+    #    a. 宙に浮いた長い名前の項目を消した印にする
+    #    b. 今の終わりの印より後ろ (まだ見えない所) と、新しい終わりの印を先に書いて同期する
+    #    c. 残り (E5h の空き・今の終わりの印の場所・置き換える項目) を書く
+    #    途中で失敗したら、書いた項目を元に戻してから止める。
+    order: Dict[int, Tuple[int, int, int]] = {}
+    for cl, marker in marker_by_dir.items():
+        all_slots = slots_by_dir[(cl, "all")]
+        mi = all_slots.index(marker) if marker is not None else len(all_slots)
+        for idx, o in enumerate(all_slots):
+            order[o] = (1 if idx > mi else 2, cl, idx)
+    phases = [sorted(inval_writes, key=lambda o: order.get(o, (0, 0, o))[1:])]
+    phases.append(sorted((o for o in entry_writes if order.get(o, (2,))[0] == 1), key=lambda o: order[o][1:]))
+    phases.append(sorted((o for o in entry_writes if order.get(o, (2,))[0] != 1),
+                         key=lambda o: order.get(o, (2, -1, o))[1:]))
+    writes = dict(inval_writes)
+    writes.update(entry_writes)
+    originals = {o: _read_at(f, o, 32) for o in writes}
+    written: List[int] = []
+    try:
+        for ph in phases:
+            for o in ph:
+                written.append(o)
+                f.seek(o)
+                _write_all(f, writes[o])
+            os.fsync(f.fileno())
+        for o, data in writes.items():
+            if _read_at(f, o, 32) != data:
+                raise LdhddError("書いたディレクトリ項目を読み戻したら一致しませんでした")
+    except BaseException:
+        for o in reversed(written):
+            try:
+                f.seek(o)
+                _write_all(f, originals[o])
+            except OSError:
+                pass
+        try:
+            os.fsync(f.fileno())
+        except OSError:
+            pass
+        raise
+    # 4. 新しい項目が確かに書けて読み戻せてから、置き換えた前のファイルの鎖を空きに戻す
     if freed:
         for c in freed:
             vol.set(c, 0)
@@ -1998,9 +2078,6 @@ def execute_add(vol: FatVolume, plan: AddPlan) -> None:
     for k in range(vol.nfats):
         if _read_at(f, vol.fat_off + k * vol.fat_bytes, vol.fat_bytes) != bytes(vol.fat):
             raise LdhddError("書いた FAT を読み戻したら一致しませんでした")
-    for off, data in entry_writes.items():
-        if _read_at(f, off, 32) != data:
-            raise LdhddError("書いたディレクトリ項目を読み戻したら一致しませんでした")
 
 
 def add(target: str, paths: List[str], to_path: str = "/", overwrite: bool = False, backup: bool = True,

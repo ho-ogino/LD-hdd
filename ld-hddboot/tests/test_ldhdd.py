@@ -2025,6 +2025,126 @@ class TestAdd(unittest.TestCase):
         self.assert_refused(path, [self.put(os.path.join("n", "README.TXT"), b"x")], "長い名前")
         self.assert_refused(path, [self.put(os.path.join("n", "README.TXT"), b"x")], "長い名前", overwrite=True)
 
+    def stale_fixture(self):
+        """[0] A.TXT / [1] 終わりの印 / [2] それらしい古い項目"""
+        path = self.vhd()
+        self.add(path, [self.put("A.TXT", b"a")])
+        with open(path, "r+b") as f:
+            vol = ldhdd.FatVolume(f)
+            slots = vol.read_dir(0).slots
+            f.seek(slots[2])
+            f.write(ldhdd.make_dir_entry(b"STALE   TXT", 0x20, 0, 0, time.time()))
+        return path, slots
+
+    def test_marker_relocation_failure_keeps_stale_hidden(self):
+        path, slots = self.stale_fixture()
+        orig = ldhdd._write_all
+
+        def fail(f, d):
+            if len(d) == 32 and d[0] == 0:  # 終わりの印を置き直す書き込み
+                raise OSError(5, "injected")
+            return orig(f, d)
+        ldhdd._write_all = fail
+        try:
+            with self.assertRaisesRegex(ldhdd.LdhddError, "injected"):
+                self.add(path, [self.put("B.TXT", b"b")])
+        finally:
+            ldhdd._write_all = orig
+        run_main(["ls", path])
+        self.assertNotIn("STALE", run_main.out)
+        self.assertNotIn("B.TXT", run_main.out)
+        # 失敗しなければ、印は STALE の位置に置き直され、STALE は見えないまま
+        self.add(path, [self.put("B.TXT", b"b")])
+        run_main(["ls", path])
+        self.assertIn("B.TXT", run_main.out)
+        self.assertNotIn("STALE", run_main.out)
+
+    def test_partial_entry_write_restores_original(self):
+        path = self.vhd()
+        self.add(path, [self.put("A.TXT", b"old" * 3000)])
+        p2 = os.path.join(self.dir, "n2", "A.TXT")
+        os.makedirs(os.path.dirname(p2))
+        with open(p2, "wb") as fh:
+            fh.write(b"new")
+        orig = ldhdd._write_all
+
+        def partial(f, d):
+            if len(d) == 32:  # 項目を 28 バイトだけ書いて失敗する
+                orig(f, d[:28])
+                raise OSError(5, "injected")
+            return orig(f, d)
+        ldhdd._write_all = partial
+        try:
+            with self.assertRaisesRegex(ldhdd.LdhddError, "injected"):
+                self.add(path, [p2], overwrite=True)
+        finally:
+            ldhdd._write_all = orig
+        f, vol = self.open_vol(path)
+        try:
+            vol.walk_check()
+            self.assertEqual(vol_read_file(vol, "/A.TXT"), b"old" * 3000)
+        finally:
+            f.close()
+
+    def test_detached_long_name_is_not_inherited(self):
+        path = self.vhd()
+        self.add(path, [self.put("A.TXT", b"a")])
+        units = [ord(c) for c in "Old.txt"] + [0] + [0xFFFF] * 5
+        e = bytearray(32)
+        e[0], e[11], e[13] = 0x41, 0x0F, ldhdd._lfn_checksum(b"NEW     TXT")
+        b = struct.pack("<13H", *units)
+        e[1:11], e[14:26], e[28:32] = b[0:10], b[10:22], b[22:26]
+        with open(path, "r+b") as f:
+            vol = ldhdd.FatVolume(f)
+            slots = vol.read_dir(0).slots
+            # [0] A.TXT / [1] 宙に浮いた長い名前 / [2] 消した項目 (空き) / [3] 終わり
+            f.seek(slots[1])
+            f.write(bytes(e))
+            f.seek(slots[2])
+            f.write(b"\xe5" + b"X      TXT" + bytes(21))
+        self.add(path, [self.put("NEW.TXT", b"n")])
+        with open(path, "rb") as f:
+            vol = ldhdd.FatVolume(f)
+            ent = vol.find(vol.read_dir(0), b"NEW     TXT")
+            self.assertIsNotNone(ent)
+            self.assertIsNone(ent.long_name)
+            self.assertEqual(ldhdd._read_at(f, slots[1], 1), b"\xe5")
+
+    @unittest.skipIf(os.name == "nt", "シンボリックリンクのテスト")
+    def test_symlink_spellings_and_replacement(self):
+        path = self.vhd()
+        self.put(os.path.join("Q", "OK.TXT"), b"ok")
+        os.symlink(os.path.join(self.src, "Q"), os.path.join(self.src, "LNK"))
+        for spelling in ("LNK", "LNK/", "LNK/.", "LNK/./"):
+            self.assert_refused(path, [os.path.join(self.src, spelling)], "シンボリックリンク")
+        # 調べた後でファイルがシンボリックリンクに置き換わったら止める
+        p = self.put("R.TXT", b"real")
+        other = self.put("OTHER.TXT", b"other")
+        orig = ldhdd.plan_add
+
+        def plan_then_swap(*a, **kw):
+            r = orig(*a, **kw)
+            os.remove(p)
+            os.symlink(other, p)
+            return r
+        ldhdd.plan_add = plan_then_swap
+        try:
+            self.assert_refused(path, [p], "置き換わりました|Too many levels|ELOOP|シンボリック")
+        finally:
+            ldhdd.plan_add = orig
+
+    @unittest.skipIf(os.name == "nt", "シンボリックリンクのテスト")
+    def test_skip_dotfiles_skips_hidden_symlink(self):
+        path = self.vhd()
+        self.put(os.path.join("H", "OK.TXT"), b"ok")
+        os.symlink(os.path.join(self.src, "H", "OK.TXT"), os.path.join(self.src, "H", ".lnk"))
+        self.add(path, [os.path.join(self.src, "H")], skip_dotfiles=True)
+        f, vol = self.open_vol(path)
+        try:
+            self.assertEqual([ldhdd.short_to_text(x.name) for x in vol.read_dir(vol.resolve_dir("/H")).entries], ["OK.TXT"])
+        finally:
+            f.close()
+
     def test_timestamps(self):
         path = self.vhd()
         p = self.put("T.TXT", b"t")
