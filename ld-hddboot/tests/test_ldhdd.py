@@ -1170,7 +1170,7 @@ class TestNewParts(unittest.TestCase):
         self.assertEqual(ldhdd.parse_size("128"), 128 << 20)
         self.assertEqual(ldhdd.parse_size("1024K"), 1 << 20)
         self.assertEqual(ldhdd.parse_size("512M"), 512 << 20)
-        for bad in ("0", "513M", "1K", "1.5M", "abc", "-1M", ""):
+        for bad in ("0", "513M", "1K", "1.5M", "abc", "-1M", "", "9" * 5000):
             with self.assertRaises(ldhdd.LdhddError, msg=bad):
                 ldhdd.parse_size(bad)
 
@@ -1333,11 +1333,13 @@ class TestNew(unittest.TestCase):
         self.assertEqual(run_main(["info", path2]), 0, run_main.err)
         self.assertIn("FAT32", run_main.out)
 
+    @unittest.skipIf(os.name == "nt", "Windows は開いているファイルを置き換えられない")
     def test_failed_creator_keeps_others_output(self):
         # 失敗した時の後始末は、自分が作ったファイルのままの時だけ消す
         path = os.path.join(self.dir, "n.vhd")
         orig = ldhdd._write_all
         calls = []
+        replaced = []
 
         def fail(f, d):
             calls.append(1)
@@ -1346,15 +1348,56 @@ class TestNew(unittest.TestCase):
                 with open(other, "wb") as o:
                     o.write(b"other")
                 os.replace(other, path)  # ほかの誰かがその名前に置いた
-                raise OSError(5, "I/O error")
+                replaced.append(True)
+                raise OSError(5, "injected")
             return orig(f, d)
         ldhdd._write_all = fail
         try:
-            with self.assertRaises(ldhdd.LdhddError):
+            with self.assertRaisesRegex(ldhdd.LdhddError, "injected"):
                 self.new()
         finally:
             ldhdd._write_all = orig
+        self.assertEqual(replaced, [True])
         self.assertEqual(read(path), b"other")
+
+    def test_fstat_failure_leaves_nothing(self):
+        orig = ldhdd.os.fstat
+        for force in (False, True):
+            path = os.path.join(self.dir, "n.vhd")
+            if force:
+                with open(path, "wb") as f:
+                    f.write(b"keep")
+            state = {"done": False}
+
+            def fstat(fd):
+                if not state["done"]:
+                    state["done"] = True
+                    raise OSError(5, "injected")
+                return orig(fd)
+            ldhdd.os.fstat = fstat
+            try:
+                with self.assertRaisesRegex(ldhdd.LdhddError, "injected"):
+                    self.new(force=force)
+            finally:
+                ldhdd.os.fstat = orig
+            self.assertEqual(os.listdir(self.dir), ["n.vhd"] if force else [], force)
+            if force:
+                self.assertEqual(read(path), b"keep")
+                os.remove(path)
+
+    def test_info_label_needs_signature_and_is_sanitized(self):
+        path, lay = self.new("l.vhd", "2M", label="ABC")
+        with open(path, "r+b") as f:
+            f.seek(128 * 512 + 43)
+            f.write(b"A\x1b[2JB")
+        run_main(["info", path])
+        self.assertIn("ラベル A?[2JB", run_main.out)
+        self.assertNotIn("\x1b", run_main.out)
+        with open(path, "r+b") as f:
+            f.seek(128 * 512 + 38)
+            f.write(b"\x00")
+        run_main(["info", path])
+        self.assertIn("ラベル (なし)", run_main.out)
 
     @unittest.skipUnless(shutil.which("fsck.fat"), "fsck.fat が無い")
     def test_fsck_fat(self):

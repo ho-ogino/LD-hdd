@@ -988,9 +988,10 @@ def describe_fat(pb: bytes, p1: "Partition", vk: VhdKind) -> str:
         return "BPB が壊れています"
     ds = res + nf * spf + (root * 32 + bps - 1) // bps
     cl = (tot - ds) // spc if tot > ds else 0
+    # ラベル欄は拡張ブート署名 (29h) がある時だけ。表示できない文字は ? にする
+    label = "".join(chr(c) if 0x20 <= c < 0x7F else "?" for c in pb[43:54]).rstrip() if pb[38] == 0x29 else "(なし)"
     return ("FAT%d、クラスタ %d バイト x %d (データ %.1fMB)、ラベル %s"
-            % (12 if cl < 4085 else 16, bps * spc, cl, cl * bps * spc / 1048576.0,
-               pb[43:54].decode("ascii", "replace").rstrip()))
+            % (12 if cl < 4085 else 16, bps * spc, cl, cl * bps * spc / 1048576.0, label))
 
 
 def info(target: str, out=None) -> None:
@@ -1047,7 +1048,7 @@ VHD_EPOCH = 946684800  # 2000-01-01 00:00:00 UTC
 
 def parse_size(text: str) -> int:
     """「128M」「16448K」「128」(単位なしは MB) をバイト数にする。1MB〜512MB"""
-    m = re.fullmatch(r"\s*(\d+)\s*([kKmM]?)\s*", text or "")
+    m = re.fullmatch(r"\s*(\d{1,12})\s*([kKmM]?)\s*", text or "")
     if not m:
         raise LdhddError("容量の書き方が違います (%r)。例: 128M、16448K" % (text,))
     unit = (m.group(2) or "M").upper()
@@ -1252,9 +1253,12 @@ def new_image(path: str, size: int, inputs: Inputs, input_paths: List[str], unit
             raise LdhddError("%s は既にあります。置き換えるなら --force を付けてください" % path)
         created = path
     committed = False
-    mine = os.fstat(fd)
+    mine = None
+    f = None
     try:
-        with os.fdopen(fd, "r+b", buffering=0) as f:
+        mine = os.fstat(fd)
+        f = os.fdopen(fd, "r+b", buffering=0)
+        with f:
             f.truncate(size)
             for off, data in ((0, mbr), (base, bpb)):
                 f.seek(off)
@@ -1275,10 +1279,15 @@ def new_image(path: str, size: int, inputs: Inputs, input_paths: List[str], unit
             os.replace(created, path)  # ここが確定
         committed = True
     except BaseException as e:
-        if not committed:
-            # 自分が作ったファイルがその名前のままの時だけ消す
+        if f is None:
             try:
-                if os.path.samestat(os.stat(created), mine):
+                os.close(fd)
+            except OSError:
+                pass
+        if not committed:
+            # 自分が作ったファイルがその名前のままの時だけ消す (同一性を読めなかった時は、作った直後なので消す)
+            try:
+                if mine is None or os.path.samestat(os.stat(created), mine):
                     os.remove(created)
             except OSError:
                 pass
