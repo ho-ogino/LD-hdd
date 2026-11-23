@@ -473,9 +473,10 @@ def looks_like_bpb(sec: bytes) -> bool:
     return _is_pow2(sec[12]) and _is_pow2(sec[13])
 
 
-def check_fat_bpb(sec: bytes, part_sectors: int, read_part=None) -> None:
+def check_fat_bpb(sec: bytes, part_sectors: int, read_part=None, fat1_only: bool = False) -> None:
     """第 1 パーティションの BPB が LSX-Dodgers で使える FAT12/16 かを確かめる。
-    read_part(off, n) はパーティション先頭からの読み出し (FAT の先頭を確かめるのに使う)"""
+    read_part(off, n) はパーティション先頭からの読み出し (FAT の先頭を確かめるのに使う)。
+    fat1_only なら FAT1 の先頭だけを確かめる (FAT2 の食い違いは FatVolume が知らせる)"""
     if not looks_like_bpb(sec):
         raise LdhddError("第 1 パーティションの先頭に BPB がありません (FAT でフォーマットされていない?)")
     bps = _u16(sec, 11)
@@ -530,7 +531,7 @@ def check_fat_bpb(sec: bytes, part_sectors: int, read_part=None) -> None:
     if not (media == 0xF0 or media >= 0xF8):
         raise LdhddError("第 1 パーティションの BPB: メディア記述子 %02X がおかしい" % media)
     if read_part is not None:
-        for k in range(nf):
+        for k in range(1 if fat1_only else nf):
             head = read_part((res + k * spf) * bps, 4)
             if fat_bits == 12:
                 ok = len(head) >= 3 and head[0] == media and head[1] == 0xFF and head[2] == 0xFF
@@ -1065,6 +1066,13 @@ def info(target: str, out=None) -> None:
         p1 = read_partitions(head)[0] if len(head) >= SECTOR else None
         pb1 = (_read_at(f, p1.lba * SECTOR, SECTOR)
                if p1 is not None and p1.ptype and (p1.lba + 1) * SECTOR <= vk.data_size else b"")
+        try:
+            vol = FatVolume(f)
+            mirror = vol.mirror_status()
+            if vol.mirror_diffs:
+                mirror += " (X1 の LSX-Dodgers で書いた後はこうなります。FAT1 を正として読み、add で書くとそろいます)"
+        except LdhddError:
+            mirror = None  # FAT として読めない時は出さない (上の FAT の行に理由が出る)
     print("対象      : %s (%s, データ %d バイト)" % (target, "固定 VHD" if vk.kind == "fixed" else "フッター無しの生イメージ", vk.data_size), file=out)
     if len(head) < SECTOR or head[510:512] != b"\x55\xaa":
         print("MBR       : なし", file=out)
@@ -1075,6 +1083,8 @@ def info(target: str, out=None) -> None:
         p1 = read_partitions(head)[0]
         if p1.ptype:
             print("FAT       : %s" % describe_fat(pb1, p1, vk), file=out)
+            if mirror is not None:
+                print("FAT の写し: %s" % mirror, file=out)
     ex = existing_boot(head)
     if not ex.present:
         print("起動部    : なし", file=out)
@@ -1497,6 +1507,12 @@ class DirListing(NamedTuple):
     detached: Dict[int, List[int]] = {}  # 空きの位置 → その直前に宙に浮いている長い名前の項目の位置
 
 
+class MirrorDiff(NamedTuple):
+    copy: int  # 写しの番号 (2 = FAT2)
+    entries: int  # FAT1 と値が違うクラスタの項目の数 (0 なら末尾の使わないバイトだけが違う)
+    first: Optional[int]  # 最初に違うクラスタの番号
+
+
 class FatVolume:
     """開いた VHD の第 1 パーティションの FAT12/16"""
 
@@ -1518,7 +1534,8 @@ class FatVolume:
         self.base = p1.lba * SECTOR
         self.part_end = (p1.lba + p1.count) * SECTOR
         bpb = _read_at(f, self.base, SECTOR)
-        check_fat_bpb(bpb, p1.count, lambda off, n: _read_at(f, self.base + off, n))
+        # FAT1 を正とするので、先頭を確かめるのも FAT1 だけ (FAT2 の先頭が違っても写しの食い違いとして知らせる)
+        check_fat_bpb(bpb, p1.count, lambda off, n: _read_at(f, self.base + off, n), fat1_only=True)
         self.bps = _u16(bpb, 11)
         self.spc = bpb[13]
         res, self.nfats, self.root_entries = _u16(bpb, 14), bpb[16], _u16(bpb, 17)
@@ -1541,12 +1558,36 @@ class FatVolume:
         fats = [bytearray(_read_at(f, self.fat_off + k * self.fat_bytes, self.fat_bytes)) for k in range(self.nfats)]
         if any(len(x) != self.fat_bytes for x in fats):
             raise LdhddError("FAT を読めません")
+        # LSX-Dodgers の HDD.COM は FAT1 だけを書く (FAT2 は古いまま) ので、写しの食い違いでは止めず、
+        # FAT1 を正として読む。食い違いは写しごとに記録して知らせる (add で書く時に全部の写しを FAT1 にそろえる)
+        self.fat_copies = [bytes(x) for x in fats]  # 各写しの元の内容 (失敗した時はそれぞれに戻す)
+        self.mirror_diffs: List[MirrorDiff] = []
         for k in range(1, self.nfats):
-            for c in range(self.max_cl + 1):
-                if self._get(fats[0], c) != self._get(fats[k], c):
-                    raise LdhddError("FAT の写しが食い違っています (クラスタ %d)。直してから使ってください" % c)
+            if fats[k] == fats[0]:
+                continue
+            cs = [c for c in range(self.max_cl + 1) if self._get(fats[0], c) != self._get(fats[k], c)]
+            self.mirror_diffs.append(MirrorDiff(k + 1, len(cs), cs[0] if cs else None))
         self.fat = fats[0]
-        self.fat_orig = bytes(fats[0])
+
+    def mirror_status(self) -> str:
+        """FAT の写しの状態の説明 (全バイトが同じ時だけ「一致」)"""
+        if self.nfats < 2:
+            return "FAT は 1 つ"
+        if not self.mirror_diffs:
+            return "一致"
+        out = []
+        for d in self.mirror_diffs:
+            if d.entries:
+                out.append("FAT%d が FAT1 と %d か所 (クラスタ %d など) 食い違い" % (d.copy, d.entries, d.first))
+            else:
+                out.append("FAT%d はクラスタの項目は FAT1 と一致、末尾の使わない部分だけ違う" % d.copy)
+        return "、".join(out)
+
+    def mirror_warning(self) -> Optional[str]:
+        if not self.mirror_diffs:
+            return None
+        return ("注意: FAT の写しが食い違っています (%s)。LSX-Dodgers の HDD.COM は FAT1 だけを書くので、"
+                "FAT1 を正として読みます" % self.mirror_status())
 
     # --- FAT
     def _get(self, fat: bytearray, c: int) -> int:
@@ -2103,17 +2144,17 @@ def execute_add(vol: FatVolume, plan: AddPlan) -> None:
             f.seek(vol.fat_off + k * vol.fat_bytes)
             _write_all(f, bytes(vol.fat))
 
-    fat_before = vol.fat_orig  # add を始める前の FAT
+    fat_before = list(vol.fat_copies)  # add を始める前の、写しごとの FAT (食い違っていればそのまま戻す)
 
-    def restore_fats(content: bytes) -> None:
-        """FAT の全部の写しを content に戻す (失敗の後始末。戻せなければそう伝える)"""
+    def restore_fats(contents: List[bytes]) -> None:
+        """FAT の写しを 1 つずつ contents[k] に戻す (失敗の後始末。戻せなければそう伝える)"""
         try:
             for k in range(vol.nfats):
                 f.seek(vol.fat_off + k * vol.fat_bytes)
-                _write_all(f, content)
+                _write_all(f, contents[k])
             os.fsync(f.fileno())
             for k in range(vol.nfats):
-                if _read_at(f, vol.fat_off + k * vol.fat_bytes, vol.fat_bytes) != content:
+                if _read_at(f, vol.fat_off + k * vol.fat_bytes, vol.fat_bytes) != contents[k]:
                     raise OSError("読み戻しが一致しません")
         except OSError as e:
             raise LdhddError("FAT の写しを元に戻せませんでした (%s)。バックアップから戻してください" % e)
@@ -2202,7 +2243,7 @@ def execute_add(vol: FatVolume, plan: AddPlan) -> None:
         except BaseException:
             # 新しい項目はもう書けている。前の鎖は使用中のまま (空きが少し減るだけ) の FAT にそろえる
             vol.fat[:] = fat_alloc
-            restore_fats(fat_alloc)
+            restore_fats([fat_alloc] * vol.nfats)
             raise
 
 
@@ -2219,6 +2260,11 @@ def add(target: str, paths: List[str], to_path: str = "/", overwrite: bool = Fal
         unlock = _lock(f) if not dry_run else None
         try:
             vol = FatVolume(f)
+            warn = vol.mirror_warning()
+            if warn:
+                print(warn, file=out)
+                print("--dry-run なので FAT の写しはそろえません" if dry_run
+                      else "書き込む時に、FAT の全部の写しを FAT1 にそろえます", file=out)
             vol.walk_check()
             plan = plan_add(vol, nodes, to_path, overwrite)
             for line in plan.lines:
@@ -2249,6 +2295,9 @@ def ls(target: str, path: str = "/", recursive: bool = False, out=None) -> None:
         out = sys.stdout
     with _open_target(target, False) as f:
         vol = FatVolume(f)
+        warn = vol.mirror_warning()
+        if warn:
+            print(warn, file=out)
         if recursive:
             vol.walk_check()
         stack = [(vol.resolve_dir(path), "/" + "/".join(short_to_text(to_short_name(p)) for p in path.replace("\\", "/").split("/") if p))]

@@ -1724,6 +1724,48 @@ class TestNew(unittest.TestCase):
         self.assertEqual(sha(path), before)
 
 
+def fat_copies(path):
+    """FAT の写しを全部、バイトのまま返す"""
+    with ldhdd._open_target(path, False) as f:
+        vol = ldhdd.FatVolume(f)
+        return [ldhdd._read_at(f, vol.fat_off + k * vol.fat_bytes, vol.fat_bytes) for k in range(vol.nfats)]
+
+
+def x1_write(path, name, data):
+    """X1 の LSX-Dodgers (HDD.COM) のように、FAT1 だけを書いてルートにファイルを置く (FAT2 は古いまま)"""
+    with ldhdd._open_target(path, True) as f:
+        vol = ldhdd.FatVolume(f)
+        n = max(1, -(-len(data) // vol.csize))
+        cs = vol.free_clusters()[:n]
+        for a, b in zip(cs, cs[1:]):
+            vol.set(a, b)
+        vol.set(cs[-1], vol.eoc)
+        for i, c in enumerate(cs):
+            f.seek(vol.cluster_off(c))
+            f.write(data[i * vol.csize:(i + 1) * vol.csize].ljust(vol.csize, b"\0"))
+        f.seek(vol.fat_off)
+        f.write(bytes(vol.fat))
+        slot = vol.read_dir(0).free[0]
+        f.seek(slot)
+        f.write(ldhdd.make_dir_entry(ldhdd.to_short_name(name), 0x20, cs[0], len(data), time.time()))
+        return cs
+
+
+def x1_delete(path, name):
+    """X1 の LSX-Dodgers のように、FAT1 だけで鎖を空きにして項目を消す (FAT2 は使用中のまま)"""
+    with ldhdd._open_target(path, True) as f:
+        vol = ldhdd.FatVolume(f)
+        e = vol.find(vol.read_dir(0), ldhdd.to_short_name(name))
+        cs = vol.chain(e.cluster, name)
+        for c in cs:
+            vol.set(c, 0)
+        f.seek(vol.fat_off)
+        f.write(bytes(vol.fat))
+        f.seek(e.off)
+        f.write(b"\xe5")
+        return cs
+
+
 def vol_read_file(vol, path):
     parts = [p for p in path.split("/") if p]
     cl = vol.resolve_dir("/".join(parts[:-1]))
@@ -2000,7 +2042,7 @@ class TestAdd(unittest.TestCase):
         self.corrupt(path, loop)
         self.assert_refused(path, [p], "祖先")
         self.assertEqual(run_main(["ls", path, "-R"]), 1)
-        # 第 2 FAT の食い違い
+        # 第 2 FAT の食い違いでは止めない (FAT1 を正として読み、書く時に写しをそろえる)
         path = self.vhd(name="c4.vhd")
         self.add(path, [self.put("A.BIN", b"a" * 5000)])
 
@@ -2008,7 +2050,11 @@ class TestAdd(unittest.TestCase):
             f.seek(vol.fat_off + vol.fat_bytes + 3 * 3 // 2 + 10)
             f.write(b"\x77")
         self.corrupt(path, second)
-        self.assert_refused(path, [p], "食い違って")
+        c1, c2 = fat_copies(path)
+        self.assertNotEqual(c1, c2)
+        self.add(path, [p])
+        c1b, c2b = fat_copies(path)
+        self.assertEqual(c1b, c2b)
 
     def test_partition_over_footer(self):
         path = self.vhd()
@@ -2292,7 +2338,9 @@ class TestAdd(unittest.TestCase):
                     self.add(path, [p2], overwrite=True)
             finally:
                 ldhdd._write_all = orig
-            f, vol = self.open_vol(path)  # 写しが食い違っていれば、ここで開けない
+            c = fat_copies(path)
+            self.assertTrue(all(x == c[0] for x in c), "FAT の写しがそろっていません")
+            f, vol = self.open_vol(path)
             try:
                 vol.walk_check()
                 if phase == "alloc":
@@ -2565,6 +2613,8 @@ class TestAdd(unittest.TestCase):
                     self.add(path, [p2], overwrite=True)
             finally:
                 ldhdd._write_all = orig
+            c = fat_copies(path)
+            self.assertTrue(all(x == c[0] for x in c), "FAT の写しがそろっていません")
             f, vol = self.open_vol(path)
             try:
                 vol.walk_check()
@@ -2693,6 +2743,244 @@ class TestAdd(unittest.TestCase):
         self.assertIn("完了しました", run_main.out)
         self.assertEqual(run_main(["add", path, os.path.join(self.src, "C"), "--no-backup"]), 1)
         self.assertIn("同じ名前のファイル", run_main.err)
+
+
+class TestFatMirror(unittest.TestCase):
+    """X1 の LSX-Dodgers は FAT1 だけを書く。FAT2 の食い違いは知らせるだけにして FAT1 を正とし、add で写しをそろえる"""
+
+    setUp = TestAdd.setUp
+    tearDown = TestAdd.tearDown
+    vhd = TestAdd.vhd
+    put = TestAdd.put
+    add = TestAdd.add
+    open_vol = TestAdd.open_vol
+
+    def read(self, path, name):
+        f, vol = self.open_vol(path)
+        try:
+            return vol_read_file(vol, name)
+        finally:
+            f.close()
+
+    def test_x1_written_then_ls_and_add(self):
+        for size in ("15M", "128M"):  # FAT12・FAT16
+            path = self.vhd(size, "x%s.vhd" % size)
+            self.add(path, [self.put("A.TXT", b"a" * 3000)])
+            x1 = os.urandom(5000)
+            x1_write(path, "X1.TXT", x1)
+            c1, c2 = fat_copies(path)
+            self.assertNotEqual(c1, c2)
+            # ls は注意を出して、FAT1 の通りに一覧を出す
+            self.assertEqual(run_main(["ls", path]), 0)
+            self.assertIn("注意: FAT の写しが食い違っています", run_main.out)
+            self.assertIn("FAT1 を正として読みます", run_main.out)
+            self.assertIn("X1.TXT", run_main.out)
+            self.assertEqual(run_main(["ls", path, "-R"]), 0)
+            self.assertEqual(run_main(["info", path]), 0)
+            self.assertRegex(run_main.out, r"FAT の写し: FAT2 が FAT1 と \d+ か所 \(クラスタ \d+ など\) 食い違い")
+            # --dry-run はそろえない (1 バイトも変えない)
+            before = sha(path)
+            out = io.StringIO()
+            ldhdd.add(path, [self.put("B.BIN", b"b" * 9000)], dry_run=True, out=out)
+            self.assertIn("--dry-run なので FAT の写しはそろえません", out.getvalue())
+            self.assertEqual(sha(path), before)
+            # add は通り、全部の写しを FAT1 にそろえる。X1 で書いたファイルのクラスタは使わない
+            out = io.StringIO()
+            ldhdd.add(path, [self.put("B.BIN", b"b" * 9000)], backup=False, out=out)
+            self.assertIn("FAT の全部の写しを FAT1 にそろえます", out.getvalue())
+            c1, c2 = fat_copies(path)
+            self.assertEqual(c1, c2)
+            self.assertEqual(self.read(path, "/X1.TXT"), x1)
+            self.assertEqual(self.read(path, "/A.TXT"), b"a" * 3000)
+            self.assertEqual(self.read(path, "/B.BIN"), b"b" * 9000)
+            f, vol = self.open_vol(path)
+            try:
+                vol.walk_check()
+                self.assertIsNone(vol.mirror_warning())
+            finally:
+                f.close()
+            self.assertEqual(run_main(["info", path]), 0)
+            self.assertIn("FAT の写し: 一致", run_main.out)
+            self.assertEqual(run_main(["ls", path]), 0)
+            self.assertNotIn("注意", run_main.out)
+
+    def test_x1_deleted_cluster_is_free(self):
+        # FAT1 で空き・FAT2 で使用中のクラスタは、FAT1 の通り空きとして使ってよい
+        path = self.vhd()
+        self.add(path, [self.put("A.TXT", b"a" * 100)])
+        freed = x1_delete(path, "A.TXT")
+        self.add(path, [self.put("B.TXT", b"b" * 100)])
+        c1, c2 = fat_copies(path)
+        self.assertEqual(c1, c2)
+        f, vol = self.open_vol(path)
+        try:
+            vol.walk_check()
+            e = vol.find(vol.read_dir(0), ldhdd.to_short_name("B.TXT"))
+            self.assertEqual(e.cluster, freed[0])
+            self.assertIsNone(vol.find(vol.read_dir(0), ldhdd.to_short_name("A.TXT")))
+            self.assertEqual(vol_read_file(vol, "/B.TXT"), b"b" * 100)
+        finally:
+            f.close()
+
+    def _inject(self, path, sources, size, calls, **kw):
+        """size バイトの書き込みの calls 回目 (1 から) を 1 回だけ失敗させる。その大きさの書き込みの中身を控える"""
+        orig = ldhdd._write_all
+        state = {"n": 0, "failed": False, "writes": []}
+
+        def fail(fh, d):
+            if len(d) == size and not state["failed"]:
+                state["n"] += 1
+                state["writes"].append(bytes(d))
+                if state["n"] == calls:
+                    state["failed"] = True
+                    raise OSError(5, "injected")
+            return orig(fh, d)
+        ldhdd._write_all = fail
+        try:
+            with self.assertRaisesRegex(ldhdd.LdhddError, "injected"):
+                self.add(path, sources, **kw)
+        finally:
+            ldhdd._write_all = orig
+        return state["writes"]
+
+    def test_failure_restores_each_copy(self):
+        # 割り当ての段 (FAT2 の書き込み) とディレクトリの段の失敗: 写しはそれぞれ add の前の内容に戻る (FAT2 は古いまま)
+        for phase in ("fat", "dir"):
+            path = self.vhd(name="r_%s.vhd" % phase)
+            self.add(path, [self.put("A.TXT", b"a" * 100)])
+            x1 = b"x1" * 700
+            x1_write(path, "X1.TXT", x1)
+            before = fat_copies(path)
+            self.assertNotEqual(before[0], before[1])
+            f, vol = self.open_vol(path)
+            fat_bytes = vol.fat_bytes
+            f.close()
+            src = self.put(os.path.join(phase, "B.BIN"), b"b" * 7000)
+            if phase == "fat":
+                self._inject(path, [src], fat_bytes, 2)
+            else:
+                self._inject(path, [src], 32, 1)
+            self.assertEqual(fat_copies(path), before)
+            self.assertEqual(self.read(path, "/X1.TXT"), x1)
+            f, vol = self.open_vol(path)
+            try:
+                vol.walk_check()
+                self.assertIsNone(vol.find(vol.read_dir(0), ldhdd.to_short_name("B.BIN")))
+            finally:
+                f.close()
+
+    def test_cleanup_failure_aligns_copies_to_alloc(self):
+        # 置き換えの後始末 (段 4) の失敗: 新しい項目は書けているので、全部の写しを割り当て後の FAT (fat_alloc) にそろえる
+        for call in (3, 4):  # 後始末の FAT1 / FAT2 の書き込み
+            path = self.vhd(name="c_%d.vhd" % call)
+            self.add(path, [self.put("A.TXT", b"old" * 3000)])
+            x1 = b"x1" * 700
+            x1_write(path, "X1.TXT", x1)
+            self.assertNotEqual(*fat_copies(path))
+            f, vol = self.open_vol(path)
+            fat_bytes = vol.fat_bytes
+            f.close()
+            src = os.path.join(self.dir, "c%d" % call, "A.TXT")
+            os.makedirs(os.path.dirname(src))
+            with open(src, "wb") as fh:
+                fh.write(b"new" * 5000)
+            writes = self._inject(path, [src], fat_bytes, call, overwrite=True)
+            fat_alloc = writes[0]  # 割り当ての段で FAT1 に書いた内容
+            self.assertEqual(writes[1], fat_alloc)  # 割り当ての段で FAT2 にも同じ内容を書いた
+            self.assertEqual(fat_copies(path), [fat_alloc, fat_alloc])
+            self.assertEqual(self.read(path, "/A.TXT"), b"new" * 5000)
+            self.assertEqual(self.read(path, "/X1.TXT"), x1)
+            f, vol = self.open_vol(path)
+            try:
+                vol.walk_check()
+            finally:
+                f.close()
+
+    def test_tail_only_difference_is_not_reported_as_equal(self):
+        path = self.vhd()
+        f, vol = self.open_vol(path)
+        used = -(-(vol.max_cl + 1) * vol.bits // 8)  # クラスタの項目が使うバイト数
+        self.assertLess(used, vol.fat_bytes)
+        tail = vol.fat_off + vol.fat_bytes + vol.fat_bytes - 1  # FAT2 の最後のバイト
+        f.close()
+        with open(path, "r+b") as fh:
+            fh.seek(tail)
+            fh.write(b"\x5a")
+        self.assertEqual(run_main(["info", path]), 0)
+        self.assertNotIn("FAT の写し: 一致", run_main.out)
+        self.assertIn("FAT2 はクラスタの項目は FAT1 と一致、末尾の使わない部分だけ違う", run_main.out)
+        self.assertEqual(run_main(["ls", path]), 0)
+        self.assertIn("注意: FAT の写しが食い違っています", run_main.out)
+        self.add(path, [self.put("A.TXT", b"a")])
+        c1, c2 = fat_copies(path)
+        self.assertEqual(c1, c2)
+        self.assertEqual(run_main(["info", path]), 0)
+        self.assertIn("FAT の写し: 一致", run_main.out)
+
+    def test_broken_fat2_header_is_a_mismatch(self):
+        # FAT2 の先頭 (メディア記述子) だけが壊れていても、FAT1 が正しければ読めて、add で直る
+        for phase in ("ok", "fail"):
+            path = self.vhd(name="h_%s.vhd" % phase)
+            self.add(path, [self.put("A.TXT", b"a" * 100)])
+            f, vol = self.open_vol(path)
+            fat2, fat_bytes = vol.fat_off + vol.fat_bytes, vol.fat_bytes
+            f.close()
+            with open(path, "r+b") as fh:
+                fh.seek(fat2)
+                fh.write(b"\x00")
+            before = fat_copies(path)
+            self.assertNotEqual(before[0], before[1])
+            self.assertEqual(run_main(["ls", path]), 0)
+            self.assertIn("注意: FAT の写しが食い違っています", run_main.out)
+            self.assertIn("A.TXT", run_main.out)
+            self.assertEqual(run_main(["info", path]), 0)
+            self.assertIn("FAT の写し: FAT2 が FAT1 と 1 か所 (クラスタ 0 など) 食い違い", run_main.out)
+            sha0 = sha(path)
+            out = io.StringIO()
+            ldhdd.add(path, [self.put("B.TXT", b"b")], dry_run=True, out=out)
+            self.assertEqual(sha(path), sha0)
+            src = self.put(os.path.join(phase, "B.TXT"), b"b" * 3000)
+            if phase == "fail":
+                self._inject(path, [src], fat_bytes, 2)
+                self.assertEqual(fat_copies(path), before)  # 壊れた先頭も含めて、それぞれ元に戻る
+            else:
+                self.add(path, [src])
+                c1, c2 = fat_copies(path)
+                self.assertEqual(c1, c2)
+                self.assertEqual(self.read(path, "/B.TXT"), b"b" * 3000)
+            self.assertEqual(self.read(path, "/A.TXT"), b"a" * 100)
+        # update は今までどおり、全部の FAT の先頭を確かめる
+        with ldhdd._open_target(path, False) as f:
+            vol = ldhdd.FatVolume(f)
+            bpb = ldhdd._read_at(f, vol.base, ldhdd.SECTOR)
+            rp = lambda off, n: ldhdd._read_at(f, vol.base + off, n)  # noqa: E731
+            with self.assertRaisesRegex(ldhdd.LdhddError, "FAT 2 の先頭"):
+                ldhdd.check_fat_bpb(bpb, (vol.part_end - vol.base) // ldhdd.SECTOR, rp)
+
+    def test_single_fat(self):
+        # FAT が 1 つの BPB: 比べる物が無く、注意も出ない
+        path = self.vhd()
+        f, vol = self.open_vol(path)
+        base, fat2, spf_bytes, root_bytes = vol.base, vol.fat_off + vol.fat_bytes, vol.fat_bytes, vol.root_entries * 32
+        f.close()
+        with open(path, "r+b") as fh:
+            fh.seek(base + 16)
+            fh.write(b"\x01")
+            fh.seek(fat2)  # 新しいルートディレクトリの位置 (元の FAT2) と、その後ろを 0 にする
+            fh.write(bytes(spf_bytes + root_bytes))
+        f, vol = self.open_vol(path)
+        try:
+            self.assertEqual(vol.nfats, 1)
+            self.assertEqual(vol.mirror_status(), "FAT は 1 つ")
+            self.assertIsNone(vol.mirror_warning())
+        finally:
+            f.close()
+        self.add(path, [self.put("A.TXT", b"a" * 3000)])
+        self.assertEqual(run_main(["ls", path]), 0)
+        self.assertNotIn("注意", run_main.out)
+        self.assertIn("A.TXT", run_main.out)
+        self.assertEqual(run_main(["info", path]), 0)
+        self.assertIn("FAT の写し: FAT は 1 つ", run_main.out)
 
 
 @unittest.skipUnless(os.environ.get("LDHDD_LDSYS"), "LDHDD_LDSYS が無い")
