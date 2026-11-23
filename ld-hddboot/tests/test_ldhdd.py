@@ -148,13 +148,29 @@ def bpb_sector(total=384, spc=4, root=512, spf=None, bps=512):
     return bytes(b)
 
 
-def vhd_footer(size, disk_type=2):
+def vhd_footer(size, disk_type=2, current=None, bad_checksum=False):
+    """固定 VHD のフッター (VHD 仕様: 大きさは big endian、チェックサムは 64〜67 を除く和の 1 の補数)"""
     f = bytearray(512)
     f[0:8] = b"conectix"
     struct.pack_into(">IIQ", f, 8, 2, 0x00010000, 0xFFFFFFFFFFFFFFFF)
-    struct.pack_into(">QQ", f, 40, size, size)
+    struct.pack_into(">QQ", f, 40, size, size if current is None else current)
     struct.pack_into(">I", f, 60, disk_type)
+    csum = (~(sum(f[:64]) + sum(f[68:])) & 0xFFFFFFFF) ^ (1 if bad_checksum else 0)
+    struct.pack_into(">I", f, 64, csum)
     return bytes(f)
+
+
+def fat_init(bpb):
+    """BPB に合わせて FAT の先頭 (予約項目) を作った区画先頭のバイト列 (BPB + FAT の先頭)"""
+    bps, spc, res, nf, root, tot16, media, spf = struct.unpack_from("<HBHBHHBH", bpb, 11)
+    tot = tot16 or struct.unpack_from("<I", bpb, 32)[0]
+    data_start = res + nf * spf + (root * 32 + bps - 1) // bps
+    clusters = (tot - data_start) // spc
+    head = bytes([media, 0xFF, 0xFF]) + (b"\xff" if clusters >= 4085 else b"")
+    out = []
+    for k in range(nf):
+        out.append(((res + k * spf) * bps, head))
+    return out
 
 
 def make_vhd(path, sectors=512, parts=((0x06, 128, None),), footer=True, disk_type=2, first=None):
@@ -168,7 +184,12 @@ def make_vhd(path, sectors=512, parts=((0x06, 128, None),), footer=True, disk_ty
         e = struct.pack("<B3sB3sII", 0, b"\0\0\0", ptype, b"\0\0\0", lba, count)
         mbr[0x1BE + 16 * i:0x1BE + 16 * i + 16] = e
         if lba * 512 + 512 <= len(img):
-            img[lba * 512:lba * 512 + 512] = bpb_sector(count)
+            bpb = bpb_sector(count)
+            img[lba * 512:lba * 512 + 512] = bpb
+            for off, head in fat_init(bpb):
+                o = lba * 512 + off
+                if o + len(head) <= len(img):
+                    img[o:o + len(head)] = head
     mbr[510:512] = b"\x55\xaa"
     img[0:512] = mbr
     if footer:
@@ -227,11 +248,17 @@ class TestMakesys(unittest.TestCase):
         com = b"\xc9" * 100
         # 0x200 + n がちょうど 0xF000 は通り、1 多いとエラー
         n_ld = 0xF000 - 0x200 - 135 - len(com)
-        ld = fake_ld_bin(top=0xFFFF - (n_ld - 7), body_len=n_ld - 7)
+        ld = fake_ld_bin(top=0xFF51 - (n_ld - 7), body_len=n_ld - 7)
         self.assertEqual(len(ldhdd.makesys(ld, com)), 0xF000 - 0x200)
-        ld2 = fake_ld_bin(top=0xFFFF - (n_ld - 6), body_len=n_ld - 6)
-        with self.assertRaises(ldhdd.LdhddError):
+        ld2 = fake_ld_bin(top=0xFF51 - (n_ld - 6), body_len=n_ld - 6)
+        with self.assertRaisesRegex(ldhdd.LdhddError, "大きすぎ"):
             ldhdd.makesys(ld2, com)
+
+    def test_stub_scratch_area(self):
+        # LD.BIN の終わりはスタブの作業場所 FF51h まで
+        ldhdd.makesys(fake_ld_bin(top=0xFF51 - 0x2000, body_len=0x2000), b"\xc9")
+        with self.assertRaisesRegex(ldhdd.LdhddError, "作業場所"):
+            ldhdd.makesys(fake_ld_bin(top=0xFF52 - 0x2000, body_len=0x2000), b"\xc9")
 
     def test_com_overwrites_stub(self):
         with self.assertRaises(ldhdd.LdhddError):
@@ -474,6 +501,102 @@ class TestUpdate(unittest.TestCase):
 
     def test_refuse_small_image(self):
         self.assert_refused(self.vhd(sectors=100, parts=((0x06, 40, 60),)))
+
+    def test_tampered_old_payload_not_trusted(self):
+        small = fake_ld_bin(top=0xE000, body_len=0x1000)
+        v = self.vhd()
+        self.quiet_update(v, inputs_from(small, self.com), backup=False)
+        sys_small = ldhdd.makesys(small, self.com)
+        old_n = len(sys_small)
+        with open(v, "r+b") as f:
+            # 外側の読み込み番地を 9 下げ、中の LD.BIN の終わりを 9 伸ばして、長さだけ辻褄を合わせる
+            run = struct.unpack_from("<H", sys_small, 1)[0]
+            f.seek(0x201)
+            f.write(struct.pack("<H", run - 9))
+            inner = 0x200 + 135 + len(self.com)
+            f.seek(inner + 3)
+            f.write(struct.pack("<H", 0xE000 + 0x1000 + 9))
+            f.seek(0x200 + old_n)
+            f.write(b"\x5a" * 9)
+            f.seek(0)
+            head = f.read(0xF000)
+        self.assertEqual(ldhdd.existing_boot(head), ldhdd.ExistingBoot(True, 0))
+        # 確かめられない前の起動部は「知らないデータ」なので、短い版でも --force が要る
+        tiny = fake_ld_bin(top=0xE800, body_len=0x800)
+        self.assert_refused(v, inputs_from(tiny, self.com))
+        # --force でも、消すのは新しい起動部の範囲だけで、後ろの番兵は残る
+        self.quiet_update(v, inputs_from(tiny, self.com), backup=False, force=True)
+        self.assertEqual(read(v)[0x200 + old_n:0x200 + old_n + 9], b"\x5a" * 9)
+
+    @unittest.skipIf(os.name == "nt", "flock のテスト")
+    def test_locked_by_other_process(self):
+        import subprocess
+        v = self.vhd()
+        before = sha(v)
+        code = ("import fcntl,sys; f=open(sys.argv[1],'r+b'); fcntl.flock(f.fileno(), fcntl.LOCK_EX);"
+                "print('locked', flush=True); sys.stdin.read()")
+        p = subprocess.Popen([sys.executable, "-c", code, v], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+        try:
+            self.assertEqual(p.stdout.readline().strip(), b"locked")
+            with self.assertRaisesRegex(ldhdd.LdhddError, "ほかのプロセス"):
+                self.quiet_update(v, backup=False)
+            self.assertEqual(sha(v), before)
+        finally:
+            p.stdin.close()
+            p.wait(10)
+            p.stdout.close()
+        self.quiet_update(v, backup=False)
+
+    def test_refuse_vhd_footer_mismatch(self):
+        v = self.vhd()
+        with open(v, "r+b") as f:
+            f.seek(-512, 2)
+            f.write(vhd_footer(512 * 512, bad_checksum=True))
+        self.assert_refused(v)
+        with open(v, "r+b") as f:
+            f.seek(-512, 2)
+            f.write(vhd_footer(512 * 512, current=256 * 512))
+        self.assert_refused(v)
+
+    def test_refuse_empty_fat(self):
+        v = self.vhd()
+        with open(v, "r+b") as f:
+            f.seek(129 * 512)
+            f.write(bytes(4))
+        self.assert_refused(v)
+
+    def test_refuse_4096_sector(self):
+        v = self.vhd()
+        bpb = bpb_sector(384 // 8, spc=1, root=128, bps=4096)
+        with open(v, "r+b") as f:
+            f.seek(128 * 512)
+            f.write(bpb)
+            for off, head in fat_init(bpb):
+                f.seek(128 * 512 + off)
+                f.write(head)
+        with self.assertRaisesRegex(ldhdd.LdhddError, "セクタサイズ 4096"):
+            self.quiet_update(v, backup=False)
+
+    def test_refuse_partition_over_512mb(self):
+        v = os.path.join(self.dir, "big.vhd")
+        sectors = (512 * 1024 * 1024) // 512 + 2048
+        count = sectors - 128
+        mbr = bytearray(512)
+        mbr[0x1BE:0x1CE] = struct.pack("<B3sB3sII", 0, b"\0\0\0", 0x06, b"\0\0\0", 128, count)
+        mbr[510:512] = b"\x55\xaa"
+        bpb = bpb_sector(count, spc=64)
+        with open(v, "wb") as f:
+            f.write(mbr)
+            f.seek(128 * 512)
+            f.write(bpb)
+            for off, head in fat_init(bpb):
+                f.seek(128 * 512 + off)
+                f.write(head)
+            f.truncate(sectors * 512)
+            f.seek(sectors * 512)
+            f.write(vhd_footer(sectors * 512))
+        with self.assertRaisesRegex(ldhdd.LdhddError, "512MB"):
+            self.quiet_update(v, backup=False)
 
     def test_dry_run_and_backup_names(self):
         v = self.vhd()

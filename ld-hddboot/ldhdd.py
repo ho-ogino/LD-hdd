@@ -76,6 +76,13 @@ _DRIVE_POS = 111  # "LD E,<DRIVE>" の値
 # MAKESYS の第 3 引数 (ドライブ) は LSX-Dodgers 1.61 以降の _PFILE の仕様変更で
 # 0x20 (空白) が入るようになった (=カレントドライブは変わらない)。今の挙動のまま再現する。
 STUB_DRIVE = 0x20
+# スタブが起動時に TSS を写す先 (MAKESYS.ASM の TSD)。TSS_E-TSS = 0x23 バイト
+STUB_TSD = 0xFF51
+
+# HDD.COM (hdd.asm) が扱える論理セクタの大きさ (256/512/1024 はそのまま、2048 は変換して扱う)
+SUPPORTED_BPS = (512, 1024, 2048)
+# SASI のアドレスは 21 ビット x 256 バイト
+SASI_LIMIT = (1 << 21) * 256
 
 # 既知の COM (info で名前を出すため)
 KNOWN_COMS = {
@@ -322,8 +329,11 @@ def makesys(ld_bin: bytes, com: bytes, unit: int = 0) -> bytes:
     # スタブの COM 複写 (ldir) の写し先 [0x0100, 0x0100+C) が実行中のスタブに重ならない
     if 0x0100 + c > run:
         raise LdhddError("COM が大きすぎます (0100+%04X がスタブの番地 %04X を越える)" % (c, run))
-    if run + n - 7 != ld.end or ld.end > 0x10000:
+    if run + n - 7 != ld.end:
         raise LdhddError("合体版の終わりが LD.BIN の終わりと合いません")  # 起きないはず
+    # スタブは起動時に TSD (FF51h〜) を作業場所に使うので、LD.BIN がそこにかからないこと
+    if ld.end > STUB_TSD:
+        raise LdhddError("LD.BIN の終わり (%04X) がスタブの作業場所 (%04X〜) にかかります" % (ld.end, STUB_TSD))
 
     t = stub
     _put16(t, 1, run)               # RUN
@@ -363,8 +373,11 @@ def parse_sys(sys_bin: bytes) -> SysInfo:
             com = sys_bin[s:s + c]
             ld_bin = sys_bin[s + c:]
             try:
-                parse_msx_bin(ld_bin)
+                rebuilt = makesys(ld_bin, com, unit)
             except LdhddError:
+                continue
+            # 外側のヘッダ・スタブの番地・中の LD.BIN のヘッダがすべて噛み合っていること
+            if rebuilt != sys_bin:
                 continue
             return SysInfo(7 + hdr.end - hdr.top, unit if unit else None, com, ld_bin)
     raise LdhddError("起動部の LD.BIN が MAKESYS の形ではありません")
@@ -399,8 +412,9 @@ def looks_like_bpb(sec: bytes) -> bool:
     return _is_pow2(sec[12]) and _is_pow2(sec[13])
 
 
-def check_fat_bpb(sec: bytes, part_sectors: int) -> None:
-    """第 1 パーティションの BPB が LSX-Dodgers で使える FAT12/16 かを確かめる"""
+def check_fat_bpb(sec: bytes, part_sectors: int, read_part=None) -> None:
+    """第 1 パーティションの BPB が LSX-Dodgers で使える FAT12/16 かを確かめる。
+    read_part(off, n) はパーティション先頭からの読み出し (FAT の先頭を確かめるのに使う)"""
     if not looks_like_bpb(sec):
         raise LdhddError("第 1 パーティションの先頭に BPB がありません (FAT でフォーマットされていない?)")
     bps = _u16(sec, 11)
@@ -410,8 +424,8 @@ def check_fat_bpb(sec: bytes, part_sectors: int) -> None:
     root = _u16(sec, 17)
     tot = _u16(sec, 19) or _u32(sec, 32)
     spf = _u16(sec, 22)
-    if not (_is_pow2(bps) and 512 <= bps <= 4096):
-        raise LdhddError("第 1 パーティションの BPB: セクタサイズ %d に対応していません" % bps)
+    if bps not in SUPPORTED_BPS:
+        raise LdhddError("第 1 パーティションの BPB: セクタサイズ %d に HDD.COM が対応していません (512/1024/2048 のみ)" % bps)
     if not (_is_pow2(spc) and spc <= 128):
         raise LdhddError("第 1 パーティションの BPB: クラスタのセクタ数 %d がおかしい" % spc)
     if spf == 0:
@@ -429,6 +443,20 @@ def check_fat_bpb(sec: bytes, part_sectors: int) -> None:
     fat_bits = 12 if clusters < 4085 else 16
     if spf * bps < ((clusters + 2) * fat_bits + 7) // 8:
         raise LdhddError("第 1 パーティションの BPB: FAT (%d セクタ) がクラスタ数 %d に足りません" % (spf, clusters))
+    media = sec[21]
+    if not (media == 0xF0 or media >= 0xF8):
+        raise LdhddError("第 1 パーティションの BPB: メディア記述子 %02X がおかしい" % media)
+    if read_part is not None:
+        for k in range(nf):
+            head = read_part((res + k * spf) * bps, 4)
+            if fat_bits == 12:
+                ok = len(head) >= 3 and head[0] == media and head[1] == 0xFF and head[2] == 0xFF
+            else:
+                # 1 番目の項目の上位 2 ビットは Windows が状態の印に使うので見ない
+                ok = (len(head) >= 4 and head[0] == media and head[1] == 0xFF
+                      and head[2] == 0xFF and (head[3] & 0x3F) == 0x3F)
+            if not ok:
+                raise LdhddError("第 1 パーティションの FAT %d の先頭がおかしい (フォーマットされていない?)" % (k + 1))
 
 
 class Partition(NamedTuple):
@@ -455,6 +483,11 @@ class VhdKind(NamedTuple):
 VHD_TYPES = {2: "固定", 3: "可変", 4: "差分"}
 
 
+def vhd_checksum(footer: bytes) -> int:
+    """VHD フッターのチェックサム (チェックサム欄 64〜67 を除いた全バイトの和の 1 の補数)"""
+    return ~(sum(footer[:64]) + sum(footer[68:SECTOR])) & 0xFFFFFFFF
+
+
 def _read_at(f, off: int, n: int) -> bytes:
     f.seek(off)
     return f.read(n)
@@ -470,6 +503,11 @@ def vhd_kind_of(f) -> VhdKind:
         if dtype != 2:
             raise LdhddError("%s VHD です。固定サイズの VHD だけに対応しています"
                              % VHD_TYPES.get(dtype, "種類 %d の" % dtype))
+        if vhd_checksum(foot) != struct.unpack_from(">I", foot, 64)[0]:
+            raise LdhddError("VHD のフッターのチェックサムが合いません")
+        current = struct.unpack_from(">Q", foot, 48)[0]
+        if current != size - SECTOR:
+            raise LdhddError("VHD のフッターの大きさ (%d バイト) が中身 (%d バイト) と合いません" % (current, size - SECTOR))
         return VhdKind("fixed", size - SECTOR)
     return VhdKind("raw", size)
 
@@ -540,7 +578,10 @@ def check_target(f, write_len: int) -> TargetCheck:
         raise LdhddError("第 1 パーティションがありません (HDD.COM は第 1 パーティションを使います)")
     if p1.lba >= 32768:
         raise LdhddError("第 1 パーティションの開始 (LBA %d) が遠すぎます (HDD.COM は 32768 未満まで)" % p1.lba)
-    check_fat_bpb(_read_at(f, p1.lba * SECTOR, SECTOR), p1.count)
+    if (p1.lba + p1.count) * SECTOR > SASI_LIMIT:
+        raise LdhddError("第 1 パーティションが 512MB を越えています (SASI で扱えるのは 512MB まで)")
+    base = p1.lba * SECTOR
+    check_fat_bpb(_read_at(f, base, SECTOR), p1.count, lambda off, n: _read_at(f, base + off, n))
     keep_from = old_end if ex.old_len else SYS_OFFSET
     nonzero = None
     for i in range(keep_from, new_end):
@@ -623,14 +664,26 @@ def make_backup(f, path: str) -> str:
     return dst
 
 
-def _lock(f) -> None:
-    """協力する書き手どうしの同時書き込みを避ける (POSIX のみ。取れなければ止める)"""
+def _lock(f):
+    """協力する書き手どうしの同時書き込みを避ける。取れなければ止める。
+    POSIX は flock (ファイル全体)、Windows は先頭 0xF000 バイトの範囲ロック。
+    どちらもファイルを閉じると外れる。"""
     try:
         import fcntl
-    except ImportError:  # Windows
-        return
+    except ImportError:
+        fcntl = None
     try:
-        fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if fcntl is not None:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return lambda: fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        import msvcrt
+        f.seek(0)
+        msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, IPL_LOAD_SIZE)
+
+        def unlock() -> None:
+            f.seek(0)
+            msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, IPL_LOAD_SIZE)
+        return unlock
     except OSError:
         raise LdhddError("ほかのプロセスがこのファイルを使っています")
 
@@ -648,48 +701,55 @@ def update(target: str, inputs: Inputs, unit: int = 0, backup: bool = True,
         out = sys.stdout
     sys_bin = makesys(inputs.ld_bin, inputs.com, unit)
     with _open_target(target, not dry_run) as f:
-        if not dry_run:
-            _lock(f)
-        chk = check_target(f, len(sys_bin))
-        p1 = chk.partitions[0]
-        print("対象      : %s (%s)" % (target, "固定 VHD" if chk.vhd.kind == "fixed" else "フッター無しの生イメージ"), file=out)
-        print("LSX-Dodgers: %s (%s)" % (ld_version(inputs.ld_bin), inputs.ld_from), file=out)
-        print("COM       : %s (%s)" % (describe_com(inputs.com), inputs.com_from), file=out)
-        print("unit      : %s" % ("スタブで %d を指定" % unit if unit else "指定なし (COM 次第。HDD.COM なら 0)"), file=out)
-        print("書く範囲  : 先頭 %d バイト (第 1 パーティションは LBA %d = %d バイト目から)"
-              % (chk.write_end, p1.lba, p1.lba * SECTOR), file=out)
-        if not chk.existing.present:
-            print("前の起動部: なし", file=out)
-        elif chk.existing.old_len:
-            print("前の起動部: あり (%d バイト)%s" % (chk.existing.old_len,
-                  " 。新しい方が短いので残りを 0 で消します" if chk.write_end > chk.new_end else ""), file=out)
-        else:
-            print("前の起動部: IPL はあるが中身を確かめられません (前の起動部として扱いません)", file=out)
-        if chk.nonzero_gap is not None:
-            msg = "起動部を書く範囲の %d バイト目に 0 でないデータがあります" % chk.nonzero_gap
-            if not force:
-                raise LdhddError(msg + "。上書きしてよい場合だけ --force を付けてください")
-            print("注意      : " + msg + " (--force で上書きします)", file=out)
-        if dry_run:
-            print("--dry-run なので書き込みません", file=out)
-            return None
-        mbr = _read_at(f, 0, SECTOR)
-        area = boot_record(mbr) + sys_bin
-        area += bytes(chk.write_end - len(area))
-        bak = None
-        if backup:
-            bak = make_backup(f, target)
-            print("バックアップ: %s" % bak, file=out)
+        unlock = _lock(f) if not dry_run else None
         try:
-            f.seek(0)
-            f.write(area)
-            f.flush()
-            os.fsync(f.fileno())
-            if _read_at(f, 0, len(area)) != area:
-                raise LdhddError("書いた内容を読み戻したら一致しませんでした")
-        except (OSError, LdhddError) as e:
-            hint = ("バックアップ %s を %s にコピーして戻してください" % (bak, target)) if bak else "バックアップはありません"
-            raise LdhddError("書き込みに失敗しました: %s。%s" % (e, hint))
+            return _update_locked(f, target, inputs, sys_bin, unit, backup, force, dry_run, out)
+        finally:
+            if unlock is not None:
+                unlock()
+
+
+def _update_locked(f, target, inputs, sys_bin, unit, backup, force, dry_run, out) -> Optional[str]:
+    chk = check_target(f, len(sys_bin))
+    p1 = chk.partitions[0]
+    print("対象      : %s (%s)" % (target, "固定 VHD" if chk.vhd.kind == "fixed" else "フッター無しの生イメージ"), file=out)
+    print("LSX-Dodgers: %s (%s)" % (ld_version(inputs.ld_bin), inputs.ld_from), file=out)
+    print("COM       : %s (%s)" % (describe_com(inputs.com), inputs.com_from), file=out)
+    print("unit      : %s" % ("スタブで %d を指定" % unit if unit else "指定なし (COM 次第。HDD.COM なら 0)"), file=out)
+    print("書く範囲  : 先頭 %d バイト (第 1 パーティションは LBA %d = %d バイト目から)"
+          % (chk.write_end, p1.lba, p1.lba * SECTOR), file=out)
+    if not chk.existing.present:
+        print("前の起動部: なし", file=out)
+    elif chk.existing.old_len:
+        print("前の起動部: あり (%d バイト)%s" % (chk.existing.old_len,
+              " 。新しい方が短いので残りを 0 で消します" if chk.write_end > chk.new_end else ""), file=out)
+    else:
+        print("前の起動部: IPL はあるが中身を確かめられません (前の起動部として扱いません)", file=out)
+    if chk.nonzero_gap is not None:
+        msg = "起動部を書く範囲の %d バイト目に 0 でないデータがあります" % chk.nonzero_gap
+        if not force:
+            raise LdhddError(msg + "。上書きしてよい場合だけ --force を付けてください")
+        print("注意      : " + msg + " (--force で上書きします)", file=out)
+    if dry_run:
+        print("--dry-run なので書き込みません", file=out)
+        return None
+    mbr = _read_at(f, 0, SECTOR)
+    area = boot_record(mbr) + sys_bin
+    area += bytes(chk.write_end - len(area))
+    bak = None
+    if backup:
+        bak = make_backup(f, target)
+        print("バックアップ: %s" % bak, file=out)
+    try:
+        f.seek(0)
+        f.write(area)
+        f.flush()
+        os.fsync(f.fileno())
+        if _read_at(f, 0, len(area)) != area:
+            raise LdhddError("書いた内容を読み戻したら一致しませんでした")
+    except (OSError, LdhddError) as e:
+        hint = ("バックアップ %s を %s にコピーして戻してください" % (bak, target)) if bak else "バックアップはありません"
+        raise LdhddError("書き込みに失敗しました: %s。%s" % (e, hint))
     print("完了しました", file=out)
     return bak
 
