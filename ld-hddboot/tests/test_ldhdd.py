@@ -677,9 +677,11 @@ class TestUpdate(unittest.TestCase):
         orig = ldhdd.os.fsync
         calls = []
 
+        target_ino = os.stat(v).st_ino
+
         def fsync(fd):
             calls.append(fd)
-            if len(calls) >= 2:  # 1 回目はバックアップ、2 回目は対象
+            if os.fstat(fd).st_ino == target_ino:  # 対象への書き込みの後の fsync だけ失敗させる
                 raise OSError(5, "I/O error")
             return orig(fd)
         ldhdd.os.fsync = fsync
