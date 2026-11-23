@@ -319,17 +319,23 @@ def ld_version(data: bytes) -> str:
     return m.group(0).decode("ascii", "replace").strip() if m else "不明"
 
 
-def build_stub(unit: int) -> Tuple[bytearray, int, int]:
+def build_stub(unit: int, legacy: bool = False) -> Tuple[bytearray, int, int]:
     """(スタブ, TSS のファイル位置, DRIVE のファイル位置) を返す。
-    unit 0 は MAKESYS と同じ。unit 1〜3 は JP $0100 の前に LD A,'n' / LD ($005D),A を足し、
-    HDD.COM の第 1 引数 (FCB1 の名前部) に番号を渡す (HDD.COM は書き換えない)。"""
+    unit 0 は MAKESYS と同じ。unit 1〜3 は JP $0100 の前に LD HL,2000H+'n' / LD ($005D),HL を足し、
+    HDD.COM の第 1 引数 (FCB1 の名前部) を「数字 + 空白」にする (HDD.COM は書き換えない)。
+    MAKESYS のスタブの空白で埋めるループは INC HL が無く 005DH しか埋めないので、
+    005EH の空白もここで書く (HDD.COM の getnum は空白まで読む)。
+    legacy=True は、005EH を書かなかった以前の版 (LD A,'n' / LD ($005D),A) の形 (見分ける時だけ使う)。"""
     if unit not in (0, 1, 2, 3):
         raise LdhddError("unit は 0〜3 です (%r)" % (unit,))
     stub = bytearray(STUB_TEMPLATE)
     tss = _TSS_POS
     drive = _DRIVE_POS
     if unit:
-        ins = bytes([0x3E, 0x30 + unit, 0x32, 0x5D, 0x00])
+        if legacy:
+            ins = bytes([0x3E, 0x30 + unit, 0x32, 0x5D, 0x00])
+        else:
+            ins = bytes([0x21, 0x30 + unit, 0x20, 0x22, 0x5D, 0x00])
         stub[_JP_0100_POS:_JP_0100_POS] = ins
         tss += len(ins)
         drive += len(ins)
@@ -354,14 +360,14 @@ def makesys(ld_bin: bytes, com: bytes, unit: int = 0) -> bytes:
     return assemble_sys(ld_bin, com, unit)
 
 
-def assemble_sys(ld_bin: bytes, com: bytes, unit: int = 0, drive: int = STUB_DRIVE) -> bytes:
+def assemble_sys(ld_bin: bytes, com: bytes, unit: int = 0, drive: int = STUB_DRIVE, legacy: bool = False) -> bytes:
     """合体版 LD.BIN を組み立てる (新しく作る時は makesys を使う)。
     既にある起動部を見分ける時の作り直しにも使うので、LD.BIN の中身の検査はここではしない。
     drive はスタブの DRIVE 値 (既定 0x20 = 今の MAKESYS と同じ)"""
     ld = parse_msx_bin(ld_bin)
     if len(com) < 1:
         raise LdhddError("COM が空です")
-    stub, tss_pos, drive_pos = build_stub(unit)
+    stub, tss_pos, drive_pos = build_stub(unit, legacy)
     s = len(stub)
     c = len(com)
     com_start = ld.top - 7 - c
@@ -403,13 +409,14 @@ class SysInfo(NamedTuple):
     unit_override: Optional[int]  # スタブで指定した unit (無ければ None)
     com: bytes
     ld_bin: bytes
+    legacy_unit: bool = False  # 以前の版の --unit (005EH を書かない、効かない形)
 
 
 def parse_sys(sys_bin: bytes) -> SysInfo:
     """合体版 LD.BIN を分解する (info 用)"""
     hdr = parse_msx_bin(sys_bin, "起動部の LD.BIN")
-    for unit in (0, 1, 2, 3):
-        stub, tss_pos, drive_pos = build_stub(unit)
+    for unit, legacy in ((0, False), (1, False), (2, False), (3, False), (1, True), (2, True), (3, True)):
+        stub, tss_pos, drive_pos = build_stub(unit, legacy)
         s = len(stub)
         if len(sys_bin) < s + 8:
             continue
@@ -420,13 +427,13 @@ def parse_sys(sys_bin: bytes) -> SysInfo:
             com = sys_bin[s:s + c]
             ld_bin = sys_bin[s + c:]
             try:
-                rebuilt = assemble_sys(ld_bin, com, unit, drive=cand[drive_pos])
+                rebuilt = assemble_sys(ld_bin, com, unit, drive=cand[drive_pos], legacy=legacy)
             except LdhddError:
                 continue
             # 外側のヘッダ・スタブの番地・中の LD.BIN のヘッダがすべて噛み合っていること
             if rebuilt != sys_bin:
                 continue
-            return SysInfo(7 + hdr.end - hdr.top, unit if unit else None, com, ld_bin)
+            return SysInfo(7 + hdr.end - hdr.top, unit if unit else None, com, ld_bin, legacy)
     raise LdhddError("起動部の LD.BIN が MAKESYS の形ではありません")
 
 
@@ -1043,7 +1050,10 @@ def info(target: str, out=None) -> None:
     print("起動部    : あり (LD.BIN %d バイト)" % ex.old_len, file=out)
     print("LSX-Dodgers: %s" % ld_version(si.ld_bin), file=out)
     print("COM       : %s" % describe_com(si.com), file=out)
-    if si.unit_override is not None:
+    if si.legacy_unit:
+        print("unit      : スタブで %d を指定 (以前の版の誤りで、この指定は効きません。update し直してください)"
+              % si.unit_override, file=out)
+    elif si.unit_override is not None:
         print("unit      : スタブで %d を指定" % si.unit_override, file=out)
     else:
         print("unit      : スタブでの指定なし (unit は COM 次第)", file=out)
