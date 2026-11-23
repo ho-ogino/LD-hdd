@@ -532,21 +532,52 @@ class TestUpdate(unittest.TestCase):
 
     def test_first_install_checks_whole_boot_area(self):
         # IPL がまだ無い VHD: 書く範囲の後ろ (先頭 60KB の中) にある別のデータも、最初の書き込みで --force を求める
+        small_ld = fake_ld_bin(top=0xE000, body_len=0x1000)
+        short_end = 0x200 + len(ldhdd.makesys(small_ld, self.com))
+        long_sys = ldhdd.makesys(self.ld161, self.com)
+        long_end = 0x200 + len(long_sys)
+        sentinel = (short_end + long_end) // 2  # 短い版の後ろ、長い版の内側
         v = self.vhd()
         with open(v, "r+b") as f:
-            f.seek(0x5000)
+            f.seek(sentinel)
             f.write(b"\x42")
-        small_ld = fake_ld_bin(top=0xE000, body_len=0x1000)
         self.assert_refused(v, inputs_from(small_ld, self.com))
-        self.quiet_update(v, inputs_from(small_ld, self.com), backup=False, force=True)
-        # --force で範囲を名乗った後は、長い版も --force 無しで書ける
+        out = io.StringIO()
+        ldhdd.update(v, inputs_from(small_ld, self.com), backup=False, force=True, out=out)
+        self.assertIn("今回は上書きしません", out.getvalue())
+        self.assertEqual(read(v)[sentinel], 0x42)
+        # --force で範囲を名乗った後は、長い版が --force 無しで番兵を上書きする
         self.quiet_update(v, backup=False)
-        # パーティションより後ろのデータは範囲の外なので見ない
-        v2 = self.vhd("t2.vhd")
-        with open(v2, "r+b") as f:
-            f.seek(128 * 512 + 0x4000)
-            f.write(b"\x42")
+        self.assertEqual(read(v)[0x200:long_end], long_sys)
+        # パーティションが範囲の内側 (0x8000) から始まれば、そこから先は見ない
+        v2 = self.vhd("t2.vhd", parts=((0x06, 64, None),))
         self.quiet_update(v2, inputs_from(small_ld, self.com), backup=False)
+
+    def test_boot_area_needs_known_loader(self):
+        # FCB が一致してもローダーが違えば、起動ファイルの範囲として扱わず --force を求める
+        small_ld = fake_ld_bin(top=0xE000, body_len=0x1000)
+        v = self.vhd()
+        self.quiet_update(v, inputs_from(small_ld, self.com), backup=False)
+        old_n = len(ldhdd.makesys(small_ld, self.com))
+        with open(v, "r+b") as f:
+            f.seek(0x30)
+            f.write(b"\x00")  # ローダーを 1 バイト変える
+            f.seek(0x200 + old_n)
+            f.write(b"\x42")
+        self.assert_refused(v)
+        self.quiet_update(v, backup=False, force=True)
+
+    def test_first_install_reports_both_effects(self):
+        v = self.vhd()
+        with open(v, "r+b") as f:
+            f.seek(0x300)
+            f.write(b"\x11")  # 書く範囲の中
+            f.seek(0x9000)
+            f.write(b"\x22")  # 書く範囲の後ろ (起動ファイルの範囲の中)
+        out = io.StringIO()
+        ldhdd.update(v, self.inputs, backup=False, force=True, out=out)
+        self.assertIn("--force で上書きします", out.getvalue())
+        self.assertIn("今回は上書きしません", out.getvalue())
 
     def test_gap_residue_needs_exact_ipl_fcb(self):
         # IPL 用 FCB が 1 バイトでも違えば (例: size が F000 でない)、今までどおり --force が要る
@@ -2565,6 +2596,42 @@ class TestAdd(unittest.TestCase):
             self.assert_refused(path, [self.put("B.TXT", b"b")], "injected")
         finally:
             ldhdd.plan_add, ldhdd._read_at = orig_plan, orig_read
+
+    def test_file_into_deepest_directory(self):
+        path = self.vhd()
+        deep = "/" + "/".join("D%d" % i for i in range(64))
+        self.add(path, [self.put("A.TXT", b"a")], to_path=deep)  # 64 段のフォルダを作る
+        self.add(path, [self.put("B.TXT", b"b")], to_path=deep)  # その一番下にファイルだけを足す
+        f, vol = self.open_vol(path)
+        try:
+            self.assertEqual(vol_read_file(vol, deep + "/B.TXT"), b"b")
+        finally:
+            f.close()
+
+    def test_dropped_extension_zero_fill_refused(self):
+        path, ext_off, csize, free0 = self.full_dir_with_stale_extension()
+        orig = ldhdd._write_all
+        state = {"dropped": False}
+
+        def drop(fh, d):
+            if len(d) == csize and d == bytes(csize) and fh.tell() == ext_off and not state["dropped"]:
+                state["dropped"] = True
+                return None  # 0 埋めを書いたふりをする
+            return orig(fh, d)
+        ldhdd._write_all = drop
+        try:
+            self.put(os.path.join("MORE", "FULL", "X.TXT"), b"x")
+            with self.assertRaisesRegex(ldhdd.LdhddError, "0 で埋められません"):
+                self.add(path, [os.path.join(self.src, "MORE", "FULL")])
+        finally:
+            ldhdd._write_all = orig
+        f, vol = self.open_vol(path)
+        try:
+            vol.walk_check()
+            self.assertEqual(len(vol.read_dir(vol.resolve_dir("/FULL")).entries), 126)
+            self.assertEqual(len(vol.free_clusters()), free0)
+        finally:
+            f.close()
 
     def test_too_deep_refused(self):
         path = self.vhd()

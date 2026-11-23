@@ -647,6 +647,7 @@ class TargetCheck(NamedTuple):
     existing: ExistingBoot
     nonzero_gap: Optional[int]  # 隙間で 0 でなかった最初の位置 (起動ファイルの範囲と分かる時は None)
     residue: int = 0  # 起動ファイルの範囲の中で上書きする、0 でないバイト数 (前の起動部として確かめた所を除く)
+    nonzero_beyond: Optional[int] = None  # 今回は書かないが起動ファイルの範囲の中にある、0 でない最初の位置
 
 
 def check_target(f, write_len: int) -> TargetCheck:
@@ -693,7 +694,10 @@ def check_target(f, write_len: int) -> TargetCheck:
     residue = 0
     # 起動セクタの IPL 用 FCB が LSX-DodgersHD の物 (名前・size=F000・entry=0021 などが一致) なら、
     # IPL が読む先頭 0xF000 バイトは起動ファイルの範囲そのもの。パーティションと重ならないことは上で確かめた
-    boot_file = head[:0x20] == BOOT_LOADER[:0x20]
+    # IPL 用 FCB とローダー (先頭 0x43 バイト) がこのツール・旧手順の物と一致する時だけ、
+    # 先頭 0xF000 を起動ファイルの範囲として扱う (別のローダーはその範囲を自分のデータに使っているかもしれない)
+    boot_file = head[:len(BOOT_LOADER)] == BOOT_LOADER
+    beyond = None
     if boot_file:
         for i in range(keep_from, new_end):
             if head[i] != 0:
@@ -702,11 +706,17 @@ def check_target(f, write_len: int) -> TargetCheck:
         # まだ LSX-DodgersHD の IPL が無い: これから IPL を書くと先頭 0xF000 (パーティションの手前まで) を
         # 起動ファイルの範囲と名乗ることになるので、書く範囲だけでなくその範囲全体に 0 でないデータが無いこと
         area_end = min([IPL_LOAD_SIZE, len(head)] + [p.lba * SECTOR for p in used])
-        for i in range(keep_from, max(new_end, area_end)):
+        for i in range(keep_from, new_end):
             if head[i] != 0:
                 nonzero = i
                 break
-    return TargetCheck(vk, parts, new_end, write_end, ex, nonzero, residue)
+        for i in range(new_end, area_end):
+            if head[i] != 0:
+                beyond = i
+                break
+        if nonzero is None:
+            nonzero = beyond
+    return TargetCheck(vk, parts, new_end, write_end, ex, nonzero, residue, beyond)
 
 
 # ---------------------------------------------------------------------------
@@ -993,10 +1003,11 @@ def _update_locked(f, target, inputs, sys_bin, unit, backup, force, dry_run, out
         if not force:
             raise LdhddError(msg + "。上書きしてよい場合だけ --force を付けてください")
         if chk.nonzero_gap < chk.new_end:
-            print("注意      : " + msg + " (--force で上書きします)", file=out)
-        else:
-            print("注意      : " + msg + " (今回は上書きしませんが、IPL を書いた後はこの範囲を起動ファイルとして扱い、"
-                  "後の update では --force 無しで上書きします)", file=out)
+            print("注意      : 起動部を書く範囲の %d バイト目からの 0 でないデータを、--force で上書きします" % chk.nonzero_gap,
+                  file=out)
+        if chk.nonzero_beyond is not None:
+            print("注意      : %d バイト目からの 0 でないデータは今回は上書きしませんが、IPL を書いた後はこの範囲を"
+                  "起動ファイルとして扱い、後の update では --force 無しで上書きします" % chk.nonzero_beyond, file=out)
     if dry_run:
         print("--dry-run なので書き込みません", file=out)
         return None
@@ -1796,6 +1807,9 @@ MAX_DEPTH = 64  # フォルダの深さの上限 (LSX-Dodgers のパスの長さ
 
 
 def _host_depth(n: HostNode) -> int:
+    """入れる物が作るフォルダの段数 (ファイルだけなら 0)"""
+    if not n.is_dir:
+        return 0
     depth = 0
     stack = [(n, 1)]
     while stack:
@@ -2015,6 +2029,7 @@ def execute_add(vol: FatVolume, plan: AddPlan) -> None:
 
     detached_by_dir: Dict[int, Dict[int, List[int]]] = {}
     ext_slots: set = set()  # 伸ばしたディレクトリの新しいクラスタの項目 (0 で埋めてから使う)
+    ext_clusters: List[int] = []
     inval_writes: Dict[int, bytes] = {}
 
     def ensure_listing(cl: int) -> None:
@@ -2043,6 +2058,7 @@ def execute_add(vol: FatVolume, plan: AddPlan) -> None:
             data_writes.append((vol.cluster_off(c), bytes(vol.csize)))
             new_slots = [vol.cluster_off(c) + i * 32 for i in range(vol.csize // 32)]
             ext_slots.update(new_slots)
+            ext_clusters.append(c)
             trailing = detached_by_dir[cl].pop(TRAILING_LFN, None)
             if trailing:
                 detached_by_dir[cl][new_slots[0]] = trailing
@@ -2131,6 +2147,10 @@ def execute_add(vol: FatVolume, plan: AddPlan) -> None:
         f.seek(off)
         _write_all(f, data)
     os.fsync(f.fileno())
+    # 伸ばしたディレクトリの 0 埋めは、FAT でつなぐ前に読み戻して確かめる (まだどこからもつながっていない)
+    for c in ext_clusters:
+        if _read_at(f, vol.cluster_off(c), vol.csize) != bytes(vol.csize):
+            raise LdhddError("ディレクトリを伸ばす先のクラスタを 0 で埋められませんでした (何もつないでいません)")
     # 2. FAT (全部の写し)。置き換える前のファイルの鎖は、まだ使用中のまま。読み戻して確かめるまでが 1 つ
     try:
         write_fats()
