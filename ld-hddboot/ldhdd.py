@@ -1115,7 +1115,7 @@ def choose_fat_layout(total: int, fat: str = "auto") -> FatLayout:
         spc = 1
         while True:
             lay = _fat_layout_for(total, spc, 12)
-            if lay is not None and 1 <= lay.clusters < 4085:
+            if lay is not None and 1 <= lay.clusters <= FAT12_LAST_CLUSTER - 1:
                 break
             spc *= 2
             if spc > 128:
@@ -1126,7 +1126,7 @@ def choose_fat_layout(total: int, fat: str = "auto") -> FatLayout:
         while (lay is None or lay.clusters < 4085) and spc > 1:
             spc //= 2
             lay = _fat_layout_for(total, spc, 16)
-        if lay is None or not 4085 <= lay.clusters <= 65524:
+        if lay is None or not 4085 <= lay.clusters <= FAT16_LAST_CLUSTER - 1:
             raise LdhddError("この容量 (パーティション %d セクタ) は FAT16 にできません" % total)
     else:
         raise LdhddError("--fat は auto / 12 / 16 です (%r)" % (fat,))
@@ -1335,6 +1335,8 @@ def new_image(path: str, size: int, inputs: Inputs, input_paths: List[str], unit
 # ---------------------------------------------------------------------------
 
 SHORT_CHARS = set(b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!#$%&'()-@^_`{}~")
+FAT12_LAST_CLUSTER = 0xFEF  # これより大きい番号は予約の値 (0xFF0〜) と重なる
+FAT16_LAST_CLUSTER = 0xFFEF
 TRAILING_LFN = -1  # DirListing.detached の、ディレクトリの最後に宙に浮いた長い名前の項目の鍵
 DOT_NAME = b".          "
 DOTDOT_NAME = b"..         "
@@ -1487,6 +1489,8 @@ class FatVolume:
         self.max_cl = self.nclusters + 1
         self.bits = 12 if self.nclusters < 4085 else 16
         self.eoc = 0xFFF if self.bits == 12 else 0xFFFF
+        # FAT12 の 0xFF0〜・FAT16 の 0xFFF0〜 は予約の値なので、クラスタ番号としては使わない
+        self.usable_max = min(self.max_cl, FAT12_LAST_CLUSTER if self.bits == 12 else FAT16_LAST_CLUSTER)
         if self.data_off + self.nclusters * self.csize > self.part_end or tot * self.bps > p1.count * SECTOR:
             raise LdhddError("第 1 パーティションの BPB の大きさがパーティションを越えています")
         fats = [bytearray(_read_at(f, self.fat_off + k * self.fat_bytes, self.fat_bytes)) for k in range(self.nfats)]
@@ -1526,7 +1530,7 @@ class FatVolume:
         seen = set()
         c = start
         while True:
-            if c < 2 or c > self.max_cl:
+            if c < 2 or c > self.usable_max:
                 raise LdhddError("FAT が壊れています (%s: 範囲外のクラスタ %d)" % (what, c))
             if c in seen:
                 raise LdhddError("FAT が壊れています (%s: 鎖が循環しています)" % what)
@@ -1543,7 +1547,7 @@ class FatVolume:
         return self.data_off + (c - 2) * self.csize
 
     def free_clusters(self) -> List[int]:
-        return [c for c in range(2, self.max_cl + 1) if self.get(c) == 0]
+        return [c for c in range(2, self.usable_max + 1) if self.get(c) == 0]
 
     # --- ディレクトリ
     def read_dir(self, cluster: int, what: str = "/") -> DirListing:
@@ -2043,23 +2047,15 @@ def execute_add(vol: FatVolume, plan: AddPlan) -> None:
         except OSError as e:
             raise LdhddError("FAT の写しを元に戻せませんでした (%s)。バックアップから戻してください" % e)
 
-    # 1. データ (伸ばしたディレクトリのクラスタの 0 埋めを含む)。FAT でつなぐ前に同期する
-    for off, data in data_writes:
-        f.seek(off)
-        _write_all(f, data)
-    os.fsync(f.fileno())
-    # 2. FAT (全部の写し)。置き換える前のファイルの鎖は、まだ使用中のまま
-    try:
-        write_fats()
-        os.fsync(f.fileno())
-    except BaseException:
-        restore_fats(fat_before)
-        raise
-    # 3. ディレクトリ項目。並べ方はディレクトリの中の順。
+    def verify_fats(content: bytes) -> None:
+        for k in range(vol.nfats):
+            if _read_at(f, vol.fat_off + k * vol.fat_bytes, vol.fat_bytes) != content:
+                raise LdhddError("書いた FAT を読み戻したら一致しませんでした")
+
+    # ディレクトリ項目の書き方は、何かを書く前に全部決め、元の内容も控えておく。
     #    a. 宙に浮いた長い名前の項目を消した印にする
     #    b. 今の終わりの印より後ろ (まだ見えない所) と、新しい終わりの印を先に書いて同期する
     #    c. 残り (E5h の空き・今の終わりの印の場所・置き換える項目) を書く
-    #    途中で失敗したら、書いた項目を元に戻してから止める。
     order: Dict[int, Tuple[int, int, int]] = {}
     for cl, marker in marker_by_dir.items():
         all_slots = slots_by_dir[(cl, "all")]
@@ -2073,6 +2069,21 @@ def execute_add(vol: FatVolume, plan: AddPlan) -> None:
     writes = dict(inval_writes)
     writes.update(entry_writes)
     originals = {o: _read_at(f, o, 32) for o in writes}
+
+    # 1. データ (伸ばしたディレクトリのクラスタの 0 埋めを含む)。FAT でつなぐ前に同期する
+    for off, data in data_writes:
+        f.seek(off)
+        _write_all(f, data)
+    os.fsync(f.fileno())
+    # 2. FAT (全部の写し)。置き換える前のファイルの鎖は、まだ使用中のまま。読み戻して確かめるまでが 1 つ
+    try:
+        write_fats()
+        os.fsync(f.fileno())
+        verify_fats(bytes(vol.fat))
+    except BaseException:
+        restore_fats(fat_before)
+        raise
+    # 3. ディレクトリ項目。途中で失敗したら、書いた項目を元に戻し、FAT も書く前に戻してから止める
     written: List[int] = []
     try:
         for ph in phases:
@@ -2110,15 +2121,12 @@ def execute_add(vol: FatVolume, plan: AddPlan) -> None:
         try:
             write_fats()
             os.fsync(f.fileno())
+            verify_fats(bytes(vol.fat))
         except BaseException:
             # 新しい項目はもう書けている。前の鎖は使用中のまま (空きが少し減るだけ) の FAT にそろえる
             vol.fat[:] = fat_alloc
             restore_fats(fat_alloc)
             raise
-    # 読み戻し
-    for k in range(vol.nfats):
-        if _read_at(f, vol.fat_off + k * vol.fat_bytes, vol.fat_bytes) != bytes(vol.fat):
-            raise LdhddError("書いた FAT を読み戻したら一致しませんでした")
 
 
 def add(target: str, paths: List[str], to_path: str = "/", overwrite: bool = False, backup: bool = True,

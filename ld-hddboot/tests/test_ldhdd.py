@@ -2253,21 +2253,42 @@ class TestAdd(unittest.TestCase):
         for i in range(126):
             self.put(os.path.join("FULL", "F%d.TXT" % i), b"%d" % i)
         self.add(path, [os.path.join(self.src, "FULL")])
+        f0, vol0 = self.open_vol(path)
+        fat_bytes, csize = vol0.fat_bytes, vol0.csize
+        ext = vol0.free_clusters()[1]  # 1 つ目は X.TXT、2 つ目がディレクトリを伸ばす先
+        ext_off = vol0.cluster_off(ext)
+        f0.close()
+        # 伸ばす先のクラスタに、それらしい古い項目を置いておく
+        with open(path, "r+b") as fh:
+            fh.seek(ext_off)
+            fh.write(ldhdd.make_dir_entry(b"STALE   TXT", 0x20, 0, 0, time.time()) * (csize // 32))
         events = []
         orig_w, orig_s = ldhdd._write_all, ldhdd.os.fsync
-        f0, vol0 = self.open_vol(path)
-        fat_bytes = vol0.fat_bytes
-        f0.close()
-        ldhdd._write_all = lambda fh, d: (events.append("fat" if len(d) == fat_bytes else "w"), orig_w(fh, d))[1]
+
+        def w(fh, d):
+            pos = fh.tell()
+            if len(d) == fat_bytes:
+                events.append("fat")
+            elif pos == ext_off and len(d) == csize and d == bytes(csize):
+                events.append("zero")
+            else:
+                events.append("w")
+            return orig_w(fh, d)
+        ldhdd._write_all = w
         ldhdd.os.fsync = lambda fd: (events.append("sync"), orig_s(fd))[1]
         try:
             self.put(os.path.join("MORE", "FULL", "X.TXT"), b"x")
+            self.put(os.path.join("MORE", "FULL", "Y.TXT"), b"y")
             self.add(path, [os.path.join(self.src, "MORE", "FULL")])
         finally:
             ldhdd._write_all, ldhdd.os.fsync = orig_w, orig_s
+        self.assertIn("zero", events)
         first_fat = events.index("fat")
-        self.assertIn("sync", events[:first_fat])  # データ (0 埋めを含む) を同期してから FAT を書く
-        self.assertEqual(events[first_fat - 1], "sync")
+        zi = events.index("zero")
+        self.assertLess(zi, first_fat)
+        self.assertIn("sync", events[zi:first_fat])  # 0 埋めを同期してから FAT でつなぐ
+        run_main(["ls", path, "/FULL"])
+        self.assertNotIn("STALE", run_main.out)
 
     @unittest.skipIf(os.name == "nt", "FIFO のテスト")
     def test_source_replaced_by_fifo(self):
@@ -2281,10 +2302,66 @@ class TestAdd(unittest.TestCase):
             os.mkfifo(p)
             return r
         ldhdd.plan_add = plan_then_fifo
+        import signal
+
+        def timeout(signum, frame):
+            raise AssertionError("FIFO を開いたまま止まりました")
+        old = signal.signal(signal.SIGALRM, timeout)
+        signal.alarm(20)
         try:
             self.assert_refused(path, [p], "置き換わりました")
         finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, old)
             ldhdd.plan_add = orig
+
+    def reserved_fixture(self, name, total, bits):
+        path = make_vhd(os.path.join(self.dir, name), sectors=128 + total, parts=((0x01 if bits == 12 else 0x06, 128, total),))
+        with open(path, "r+b") as f:
+            bpb = bpb_sector(total, spc=1, root=512)
+            spf = struct.unpack_from("<H", bpb, 22)[0]
+            f.seek(128 * 512)
+            f.write(bytes((1 + 2 * spf + 32 + 16) * 512))  # 前の形の FAT の先頭を消す
+            f.seek(128 * 512)
+            f.write(bpb)
+            for off, head in fat_init(bpb):
+                f.seek(128 * 512 + off)
+                f.write(head)
+        return path
+
+    def test_reserved_cluster_numbers_not_used(self):
+        # FAT12 で 4084 クラスタ: 番号 0xFF0〜0xFF5 は予約の値と重なるので使わない
+        path = self.reserved_fixture("r12.vhd", 4141, 12)
+        f, vol = self.open_vol(path)
+        try:
+            self.assertEqual((vol.bits, vol.nclusters), (12, 4084))
+            self.assertEqual(max(vol.free_clusters()), 0xFEF)
+            usable = len(vol.free_clusters())
+        finally:
+            f.close()
+        self.assert_refused(path, [self.put("BIG.BIN", b"z" * ((usable + 1) * 512))], "空きが足りません")
+        self.add(path, [self.put("FIT.BIN", b"z" * (usable * 512))])
+        f, vol = self.open_vol(path)
+        try:
+            e = vol.find(vol.read_dir(0), ldhdd.to_short_name("FIT.BIN"))
+            ch = vol.chain(e.cluster, "FIT")
+            self.assertEqual(max(ch), 0xFEF)
+            self.assertTrue(all(vol.get(c) < 0xFF0 or vol.is_eoc(vol.get(c)) for c in ch))
+        finally:
+            f.close()
+        # new の FAT12 は予約の番号に届かない形を選ぶ
+        for total in range(32640, 32768, 16):
+            lay = ldhdd.choose_fat_layout(total)
+            self.assertLessEqual(lay.clusters + 1, 0xFEF, total)
+
+    def test_reserved_cluster_numbers_fat16(self):
+        path = self.reserved_fixture("r16.vhd", 65524 + 1 + 2 * 256 + 32, 16)
+        f, vol = self.open_vol(path)
+        try:
+            self.assertEqual(vol.bits, 16)
+            self.assertEqual(max(vol.free_clusters()), 0xFFEF)
+        finally:
+            f.close()
 
     def test_timestamps(self):
         path = self.vhd()
