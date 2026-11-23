@@ -992,7 +992,11 @@ def _update_locked(f, target, inputs, sys_bin, unit, backup, force, dry_run, out
         msg = "起動ファイルの範囲 (先頭 60KB、パーティションの手前まで) の %d バイト目に 0 でないデータがあります" % chk.nonzero_gap
         if not force:
             raise LdhddError(msg + "。上書きしてよい場合だけ --force を付けてください")
-        print("注意      : " + msg + " (--force で上書きします)", file=out)
+        if chk.nonzero_gap < chk.new_end:
+            print("注意      : " + msg + " (--force で上書きします)", file=out)
+        else:
+            print("注意      : " + msg + " (今回は上書きしませんが、IPL を書いた後はこの範囲を起動ファイルとして扱い、"
+                  "後の update では --force 無しで上書きします)", file=out)
     if dry_run:
         print("--dry-run なので書き込みません", file=out)
         return None
@@ -1072,8 +1076,8 @@ def info(target: str, out=None) -> None:
     print("LSX-Dodgers: %s" % ld_version(si.ld_bin), file=out)
     print("COM       : %s" % describe_com(si.com), file=out)
     if si.legacy_unit:
-        print("unit      : スタブで %d を指定 (以前の版の誤りで、この指定は効きません。update し直してください)"
-              % si.unit_override, file=out)
+        print("unit      : スタブで %d を指定 (以前の版の誤りで、この指定は効きません。"
+              "update --unit %d で書き直してください)" % (si.unit_override, si.unit_override), file=out)
     elif si.unit_override is not None:
         print("unit      : スタブで %d を指定" % si.unit_override, file=out)
     else:
@@ -2271,7 +2275,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("target", help="書き換える VHD (固定サイズ、MBR で区切った物)")
     add_inputs(p)
     p.add_argument("--no-backup", action="store_true", help="バックアップを取らない")
-    p.add_argument("--force", action="store_true", help="起動部を書く範囲に 0 でないデータがあっても書く")
+    p.add_argument("--force", action="store_true",
+                   help="起動ファイルの範囲 (先頭 60KB、パーティションの手前まで) に 0 でないデータがあっても書く "
+                        "(IPL がまだ無い VHD では範囲全体を、ある VHD では前の起動部と FCB を見て判断します)")
     p.add_argument("--dry-run", action="store_true", help="検査と表示だけして書かない")
 
     p = sub.add_parser("sys", help="MAKESYS 相当の合体版 LD.BIN をファイルに出す")

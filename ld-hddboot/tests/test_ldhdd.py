@@ -558,7 +558,7 @@ class TestUpdate(unittest.TestCase):
             f.seek(0x200 + old_n)
             f.write(b"\x42")
             f.seek(0x12)
-            f.write(b"\x00\xe0")  # size = E000
+            f.write(b"\xe0")  # size の上位バイトだけを変える (F000 → E000)
         self.assert_refused(v)
         self.quiet_update(v, backup=False, force=True)
 
