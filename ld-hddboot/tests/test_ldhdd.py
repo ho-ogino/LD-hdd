@@ -126,11 +126,24 @@ def make_fat12_2d(files, with_bpb=True, truncate=None):
     return bytes(img)
 
 
-def bpb_sector():
+def bpb_sector(total=384, spc=4, root=512, spf=None, bps=512):
+    """FAT12/16 の BPB (パーティション total セクタに合わせる)"""
     b = bytearray(512)
     b[0:3] = b"\xeb\x3c\x90"
     b[3:11] = b"MSDOS5.0"
-    struct.pack_into("<HBHBHHBH", b, 11, 512, 4, 1, 2, 512, 0, 0xF8, 8)
+    if spf is None:
+        spf = 1
+        while True:
+            data_start = 1 + 2 * spf + (root * 32 + bps - 1) // bps
+            clusters = (total - data_start) // spc
+            bits = 12 if clusters < 4085 else 16
+            if spf * bps >= ((clusters + 2) * bits + 7) // 8:
+                break
+            spf += 1
+    tot16 = total if total < 0x10000 else 0
+    struct.pack_into("<HBHBHHBH", b, 11, bps, spc, 1, 2, root, tot16, 0xF8, spf)
+    if not tot16:
+        struct.pack_into("<I", b, 32, total)
     b[510:512] = b"\x55\xaa"
     return bytes(b)
 
@@ -155,7 +168,7 @@ def make_vhd(path, sectors=512, parts=((0x06, 128, None),), footer=True, disk_ty
         e = struct.pack("<B3sB3sII", 0, b"\0\0\0", ptype, b"\0\0\0", lba, count)
         mbr[0x1BE + 16 * i:0x1BE + 16 * i + 16] = e
         if lba * 512 + 512 <= len(img):
-            img[lba * 512:lba * 512 + 512] = bpb_sector()
+            img[lba * 512:lba * 512 + 512] = bpb_sector(count)
     mbr[510:512] = b"\x55\xaa"
     img[0:512] = mbr
     if footer:
@@ -298,8 +311,9 @@ class TestBootRecord(unittest.TestCase):
         mbr[0x1BE:0x1FE] = bytes(range(0x40, 0x80))
         mbr[0x1FE:0x200] = b"\x55\xaa"
         rec = ldhdd.boot_record(bytes(mbr))
-        self.assertEqual(rec[:0x1BE], ASM_BOOT_HEAD)
-        self.assertEqual(rec[0x1BE:], bytes(mbr[0x1BE:]))
+        self.assertEqual(rec[:0x1B8], ASM_BOOT_HEAD[:0x1B8])
+        # ディスク署名 (0x1B8) から後ろは対象の物を残す
+        self.assertEqual(rec[0x1B8:], bytes(mbr[0x1B8:]))
         self.assertEqual(rec[0x82], 0xFF)
 
 
@@ -328,8 +342,8 @@ class TestUpdate(unittest.TestCase):
         after = read(v)
         sys_bin = ldhdd.makesys(self.ld161, self.com)
         n = 0x200 + len(sys_bin)
-        # mkldhdd.py と同じ: ldhdd_boot.bin + HDDBASE[len:]
-        legacy_ipl = ASM_BOOT_HEAD + base[0x1BE:0x200] + sys_bin
+        # mkldhdd.py と同じ (ldhdd_boot.bin + HDDBASE[len:])。ただしディスク署名 (0x1B8〜0x1BD) は残す
+        legacy_ipl = ASM_BOOT_HEAD[:0x1B8] + base[0x1B8:0x200] + sys_bin
         self.assertEqual(after, legacy_ipl + base[len(legacy_ipl):])
         self.assertEqual(after[n:], base[n:])
         self.assertEqual(read(bak), base)
@@ -416,6 +430,50 @@ class TestUpdate(unittest.TestCase):
             f.seek(0x200 + old_n)
             f.write(b"\x00")
         self.quiet_update(v, backup=False)
+
+    def test_disk_signature_kept(self):
+        v = self.vhd()
+        with open(v, "r+b") as f:
+            f.seek(0x1B8)
+            f.write(b"\xde\xad\xbe\xef")
+        self.quiet_update(v, backup=False)
+        self.assertEqual(read(v)[0x1B8:0x1BC], b"\xde\xad\xbe\xef")
+
+    def test_shrink_then_grow_without_force(self):
+        big = self.ld161
+        small = fake_ld_bin(top=0xE000, body_len=0x1000)
+        v = self.vhd()
+        self.quiet_update(v, inputs_from(big, self.com), backup=False)
+        self.quiet_update(v, inputs_from(small, self.com), backup=False)
+        n_small = 0x200 + len(ldhdd.makesys(small, self.com))
+        n_big = 0x200 + len(ldhdd.makesys(big, self.com))
+        self.assertEqual(read(v)[n_small:n_big], bytes(n_big - n_small))
+        self.quiet_update(v, inputs_from(big, self.com), backup=False)
+        self.assertEqual(read(v)[0x200:n_big], ldhdd.makesys(big, self.com))
+
+    def test_unverified_old_header_needs_force(self):
+        v = self.vhd()
+        with open(v, "r+b") as f:
+            f.write(ldhdd.BOOT_SIGNATURE)
+            f.seek(0x200)
+            # 長さ 0x3000 を名乗るが MAKESYS の形ではない
+            f.write(bytes([0xFE]) + struct.pack("<HHH", 0xC000, 0xF000 - 7, 0xC000) + b"\x11" * 16)
+        self.assert_refused(v)
+        self.quiet_update(v, force=True, backup=False)
+
+    def test_refuse_bad_fat_bpb(self):
+        for name, sec in (("tot0", bpb_sector(384)[:19] + b"\0\0" + bpb_sector(384)[21:]),
+                          ("fat32", bpb_sector(384)[:22] + b"\0\0" + bpb_sector(384)[24:]),
+                          ("toobig", bpb_sector(4000)),
+                          ("fatsmall", bpb_sector(384, spf=1, spc=1, root=16))):
+            v = self.vhd(name + ".vhd")
+            with open(v, "r+b") as f:
+                f.seek(128 * 512)
+                f.write(sec)
+            self.assert_refused(v)
+
+    def test_refuse_small_image(self):
+        self.assert_refused(self.vhd(sectors=100, parts=((0x06, 40, 60),)))
 
     def test_dry_run_and_backup_names(self):
         v = self.vhd()
