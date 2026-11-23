@@ -740,7 +740,7 @@ class TestUpdate(unittest.TestCase):
         before = sha(v)
         orig = ldhdd.os.link
 
-        def nolink(a, b):
+        def nolink(a, b, **kw):
             raise OSError(_errno.EPERM, "Operation not permitted")
         ldhdd.os.link = nolink
         try:
@@ -758,11 +758,12 @@ class TestUpdate(unittest.TestCase):
         orig = ldhdd.os.link
         taken = []
 
-        def racing_link(a, b):
-            with open(b, "wb") as f:  # 名前を付ける直前に、ほかの誰かが同じ名前を作る
+        def racing_link(a, b, **kw):
+            p = os.path.join(self.dir, b)
+            with open(p, "wb") as f:  # 名前を付ける直前に、ほかの誰かが同じ名前を作る
                 f.write(b"other")
-            taken.append(b)
-            return orig(a, b)
+            taken.append(p)
+            return orig(a, b, **kw)
         ldhdd.os.link = racing_link
         try:
             with self.assertRaisesRegex(ldhdd.LdhddError, "バックアップを作れません"):
@@ -776,52 +777,119 @@ class TestUpdate(unittest.TestCase):
     @unittest.skipIf(os.name == "nt", "ハードリンクのテスト")
     def test_backup_staging_cleanup_failure_is_not_fatal(self):
         v = self.vhd()
-        orig = ldhdd.os.remove
+        orig = ldhdd.os.unlink
 
-        def noremove(p):
-            if p.endswith(".part"):
+        def noremove(p, **kw):
+            if str(p).endswith(".part"):
                 raise OSError(13, "Permission denied")
-            return orig(p)
-        ldhdd.os.remove = noremove
+            return orig(p, **kw)
+        ldhdd.os.unlink = noremove
         err = io.StringIO()
         try:
             with contextlib.redirect_stderr(err):
                 bak = self.quiet_update(v)
         finally:
-            ldhdd.os.remove = orig
+            ldhdd.os.unlink = orig
         self.assertTrue(os.path.exists(bak))
         self.assertIn("消せませんでした", err.getvalue())
 
-    def test_backup_dir_sync_failure_keeps_image(self):
+    @unittest.skipIf(os.name == "nt", "ディレクトリの同期のテスト")
+    def test_backup_dir_fsync_observed(self):
+        # os.fsync をディレクトリの記述子で呼んだ時点で、バックアップが正式な名前で既にあること。
+        # そして、それがイメージへの書き込みより前であること
+        import stat as _stat
+        v = self.vhd()
+        events = []
+        orig_fsync, orig_write = ldhdd.os.fsync, ldhdd._write_all
+
+        def fsync(fd):
+            if _stat.S_ISDIR(os.fstat(fd).st_mode):
+                events.append(("dir", sorted(x for x in os.listdir(self.dir) if x.endswith(".bak"))))
+            return orig_fsync(fd)
+        ldhdd.os.fsync = fsync
+        ldhdd._write_all = lambda f, d: (events.append(("write", None)), orig_write(f, d))[1]
+        try:
+            bak = self.quiet_update(v)
+        finally:
+            ldhdd.os.fsync, ldhdd._write_all = orig_fsync, orig_write
+        self.assertEqual(events, [("dir", [os.path.basename(bak)]), ("write", None)])
+
+    @unittest.skipIf(os.name == "nt", "ディレクトリの同期のテスト")
+    def test_backup_dir_fsync_failure_keeps_image(self):
+        import stat as _stat
         v = self.vhd()
         before = sha(v)
-        orig = ldhdd._fsync_dir
+        orig = ldhdd.os.fsync
 
-        def fail(path):
-            raise OSError(5, "I/O error")
-        ldhdd._fsync_dir = fail
+        def fsync(fd):
+            if _stat.S_ISDIR(os.fstat(fd).st_mode):
+                raise OSError(5, "I/O error")
+            return orig(fd)
+        ldhdd.os.fsync = fsync
         try:
             with self.assertRaisesRegex(ldhdd.LdhddError, "何も書き込んでいません") as cm:
                 self.quiet_update(v)
         finally:
-            ldhdd._fsync_dir = orig
+            ldhdd.os.fsync = orig
         self.assertEqual(sha(v), before)
         baks = [x for x in os.listdir(self.dir) if x.endswith(".bak")]
         self.assertEqual(len(baks), 1)
         self.assertIn(baks[0], str(cm.exception))
 
-    @unittest.skipIf(os.name == "nt", "ディレクトリの同期のテスト")
-    def test_backup_dir_synced_before_write(self):
-        v = self.vhd()
-        order = []
-        orig_dir, orig_write = ldhdd._fsync_dir, ldhdd._write_all
-        ldhdd._fsync_dir = lambda p: (order.append("dir"), orig_dir(p))[1]
-        ldhdd._write_all = lambda f, d: (order.append("write"), orig_write(f, d))[1]
+    @unittest.skipIf(os.name == "nt", "ディレクトリの記述子のテスト")
+    def test_backup_path_changed_is_detected(self):
+        # 親のパス (シンボリックリンク) が、名前を付けた後で別のディレクトリを指すようになったら、
+        # 表示する戻し先が今作ったバックアップではなくなるので、イメージに書かずに止める
+        real1 = os.path.join(self.dir, "real1")
+        real2 = os.path.join(self.dir, "real2")
+        os.mkdir(real1)
+        os.mkdir(real2)
+        make_vhd(os.path.join(real1, "t.vhd"))
+        link_dir = os.path.join(self.dir, "cur")
+        os.symlink(real1, link_dir)
+        v = os.path.join(link_dir, "t.vhd")
+        before = sha(v)
+        orig = ldhdd.os.link
+
+        def link(a, b, **kw):
+            r = orig(a, b, **kw)
+            with open(os.path.join(real2, b), "wb") as f:  # 新しい指す先に同じ名前の別の物
+                f.write(b"other")
+            os.unlink(link_dir)
+            os.symlink(real2, link_dir)
+            return r
+        ldhdd.os.link = link
         try:
-            self.quiet_update(v)
+            with self.assertRaisesRegex(ldhdd.LdhddError, "別の物を指しています"):
+                self.quiet_update(v)
         finally:
-            ldhdd._fsync_dir, ldhdd._write_all = orig_dir, orig_write
-        self.assertEqual(order, ["dir", "write"])
+            ldhdd.os.link = orig
+        self.assertEqual(sha(os.path.join(real1, "t.vhd")), before)
+
+    def test_windows_backup_move(self):
+        # Windows の名前付けは MoveFileExW(WRITE_THROUGH、REPLACE_EXISTING なし)
+        class FakeKernel32:
+            def __init__(self):
+                self.calls = []
+
+            def MoveFileExW(self, src, dst, flags):
+                self.calls.append(flags)
+                if os.path.exists(dst):
+                    return 0
+                os.rename(src, dst)
+                return 1
+        v = self.vhd()
+        k = FakeKernel32()
+        dst = os.path.join(self.dir, "w.bak")
+        with open(v, "rb") as f:
+            self.assertEqual(ldhdd._make_backup_windows(f, v, dst, kernel32=k), dst)
+        self.assertEqual(k.calls, [ldhdd.MOVEFILE_WRITE_THROUGH])
+        self.assertEqual(read(dst), read(v))
+        # 既にある名前には失敗し、仮ファイルは残らない
+        with open(v, "rb") as f:
+            with self.assertRaises(ldhdd.LdhddError):
+                ldhdd._make_backup_windows(f, v, dst, kernel32=k)
+        self.assertEqual(sorted(os.listdir(self.dir)), ["t.vhd", "w.bak"])
 
     @unittest.skipIf(os.name == "nt", "flock のテスト")
     def test_locked_by_other_process(self):

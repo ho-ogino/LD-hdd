@@ -751,19 +751,104 @@ def _backup_path(path: str) -> str:
 
 def make_backup(f, path: str) -> str:
     """開いているファイル f の中身を、path の隣に新しい名前でコピーする。
-    仮の名前に書いて同期してから正式な名前にするので、途中で失敗しても正式な名前の物は残らない。"""
+    仮の名前に書いて同期し、既にある物を置き換えない方法で正式な名前を付け、
+    その名前もディスクに書き切ってから返す。途中で失敗したらイメージには何も書かない。"""
     dst = _backup_path(path)
-    tmp = None
     f.seek(0)
+    if os.name == "nt":
+        return _make_backup_windows(f, path, dst)
+    return _make_backup_posix(f, path, dst)
+
+
+_BACKUP_FAIL = "バックアップを作れませんでした (%s)。何も書き込んでいません"
+_NO_LINK = ("このファイルシステムでは、既にある物を置き換えずにバックアップを置けません"
+            " (自分でコピーを取ってから --no-backup を付けてください)")
+
+
+def _copy_to_fd(f, fd: int) -> None:
+    with os.fdopen(fd, "wb") as out:
+        shutil.copyfileobj(f, out, 1024 * 1024)
+        out.flush()
+        os.fsync(out.fileno())
+
+
+def _make_backup_posix(f, path: str, dst: str) -> str:
+    """親ディレクトリを 1 回だけ開き、仮ファイルの作成・名前付け・後始末・同期をすべてその記述子で行う
+    (途中で親のパスが別の場所を指すようになっても、同じディレクトリで済ませる)"""
+    dirpath = os.path.dirname(os.path.abspath(dst))
+    name = os.path.basename(dst)
+    dfd = os.open(dirpath, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    staging = None
+    leftover = None
     try:
-        # この呼び出しだけの仮ファイル (名前がぶつからない)
+        try:
+            for _ in range(100):
+                cand = "%s.%d.%s.part" % (name, os.getpid(), os.urandom(4).hex())
+                try:
+                    fd = os.open(cand, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=dfd)
+                except FileExistsError:
+                    continue
+                staging = cand
+                break
+            else:
+                raise OSError("仮ファイルの名前を決められません")
+            _copy_to_fd(f, fd)
+            try:
+                os.link(staging, name, src_dir_fd=dfd, dst_dir_fd=dfd, follow_symlinks=False)
+            except OSError as e:
+                if e.errno in (errno.EPERM, errno.EOPNOTSUPP, errno.ENOTSUP, errno.EXDEV, errno.EMLINK):
+                    raise OSError(e.errno, _NO_LINK)
+                raise
+        except OSError as e:
+            if staging is not None:
+                try:
+                    os.unlink(staging, dir_fd=dfd)
+                except OSError:
+                    pass
+            raise LdhddError(_BACKUP_FAIL % e)
+        try:
+            os.unlink(staging, dir_fd=dfd)
+        except OSError:
+            leftover = os.path.join(dirpath, staging)
+        try:
+            # 名前 (ディレクトリの項目) をディスクに書き切ってから、イメージに書き始める
+            os.fsync(dfd)
+            # 表示する戻し先のパスが、今作ったバックアップを指していること
+            published = os.stat(name, dir_fd=dfd, follow_symlinks=False)
+            if not os.path.samestat(published, os.stat(dst)):
+                raise OSError("バックアップのパス %s が別の物を指しています" % dst)
+        except OSError as e:
+            raise LdhddError("バックアップ %s の名前をディスクに書き切れませんでした (%s)。イメージには何も書き込んでいません"
+                             " (バックアップはできているかもしれません)" % (dst, e))
+    finally:
+        os.close(dfd)
+    if leftover:
+        # 正式な名前のバックアップはできている。仮の名前が消せなかっただけ
+        print("注意: 仮ファイル %s を消せませんでした (バックアップ %s はできています)" % (leftover, dst), file=sys.stderr)
+    return dst
+
+
+MOVEFILE_WRITE_THROUGH = 0x8
+
+
+def _windows_move_no_replace(src: str, dst: str, kernel32=None) -> None:
+    """MoveFileExW を MOVEFILE_REPLACE_EXISTING 無しで呼ぶ (既にある名前には失敗する)。
+    MOVEFILE_WRITE_THROUGH で、名前の変更がディスクに書き切られてから戻る。"""
+    import ctypes
+    if kernel32 is None:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    if not kernel32.MoveFileExW(src, dst, MOVEFILE_WRITE_THROUGH):
+        err = ctypes.get_last_error() if hasattr(ctypes, "get_last_error") else 0
+        raise OSError(err, "MoveFileExW が失敗しました (%d)" % err)
+
+
+def _make_backup_windows(f, path: str, dst: str, kernel32=None) -> str:
+    tmp = None
+    try:
         fd, tmp = tempfile.mkstemp(prefix=os.path.basename(path) + ".", suffix=".part",
-                                   dir=os.path.dirname(os.path.abspath(path)))
-        with os.fdopen(fd, "wb") as out:
-            shutil.copyfileobj(f, out, 1024 * 1024)
-            out.flush()
-            os.fsync(out.fileno())
-        leftover = _publish_no_replace(tmp, dst)
+                                   dir=os.path.dirname(os.path.abspath(dst)))
+        _copy_to_fd(f, fd)
+        _windows_move_no_replace(tmp, dst, kernel32)
         tmp = None
     except OSError as e:
         if tmp is not None:
@@ -771,49 +856,8 @@ def make_backup(f, path: str) -> str:
                 os.remove(tmp)
             except OSError:
                 pass
-        raise LdhddError("バックアップを作れませんでした (%s)。何も書き込んでいません" % e)
-    # 名前 (ディレクトリの項目) も確かにディスクへ書いてから、イメージに書き始める
-    try:
-        _fsync_dir(os.path.dirname(os.path.abspath(dst)))
-    except OSError as e:
-        raise LdhddError("バックアップ %s の名前をディスクに書き切れませんでした (%s)。イメージには何も書き込んでいません"
-                         " (バックアップはできているかもしれません)" % (dst, e))
-    if leftover:
-        # 正式な名前のバックアップはできている。仮の名前が消せなかっただけ
-        print("注意: 仮ファイル %s を消せませんでした (バックアップ %s はできています)" % (leftover, dst), file=sys.stderr)
+        raise LdhddError(_BACKUP_FAIL % e)
     return dst
-
-
-def _fsync_dir(path: str) -> None:
-    """ディレクトリの項目をディスクに書く (POSIX のみ。Windows ではディレクトリを同期できないので何もしない)"""
-    if os.name == "nt":
-        return
-    fd = os.open(path, os.O_RDONLY)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-
-
-def _publish_no_replace(tmp: str, dst: str) -> Optional[str]:
-    """tmp を dst という名前にする。dst が既にあれば失敗する (置き換えない)。
-    置き換えない方法が使えないファイルシステムでは、置き換えの危険がある方法には逃げずに失敗する。
-    正式な名前を付けた後に仮の名前を消せなかった時は、その仮の名前を返す (失敗にはしない)。"""
-    if os.name == "nt":
-        os.rename(tmp, dst)  # Windows の rename は既にある名前には失敗する
-        return None
-    try:
-        os.link(tmp, dst)  # 既にある名前には失敗する
-    except OSError as e:
-        if e.errno in (errno.EPERM, errno.EOPNOTSUPP, errno.ENOTSUP, errno.EXDEV, errno.EMLINK):
-            raise OSError(e.errno, "このファイルシステムでは、既にある物を置き換えずにバックアップを置けません"
-                                   " (自分でコピーを取ってから --no-backup を付けてください)")
-        raise
-    try:
-        os.remove(tmp)
-    except OSError:
-        return tmp
-    return None
 
 
 def _lock_windows(f, msvcrt_mod):
