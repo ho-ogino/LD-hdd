@@ -637,7 +637,8 @@ class TargetCheck(NamedTuple):
     new_end: int  # 新しい起動部の終わり
     write_end: int  # 書く範囲の終わり (前の起動部の方が長ければ、その残りを 0 で消す所まで)
     existing: ExistingBoot
-    nonzero_gap: Optional[int]  # 隙間で 0 でなかった最初の位置
+    nonzero_gap: Optional[int]  # 隙間で 0 でなかった最初の位置 (起動ファイルの範囲と分かる時は None)
+    residue: int = 0  # 起動ファイルの範囲の中で上書きする、前の起動部の後ろの残り (0 でないバイト数)
 
 
 def check_target(f, write_len: int) -> TargetCheck:
@@ -681,11 +682,18 @@ def check_target(f, write_len: int) -> TargetCheck:
     check_fat_bpb(_read_at(f, base, SECTOR), p1.count, lambda off, n: _read_at(f, base + off, n))
     keep_from = old_end if ex.old_len else SYS_OFFSET
     nonzero = None
+    residue = 0
+    # 起動セクタの IPL 用 FCB が LSX-DodgersHD の物 (名前・size=F000・entry=0021 などが一致) なら、
+    # IPL が読む先頭 0xF000 バイトは起動ファイルの範囲そのもの。パーティションと重ならないことは上で確かめた
+    boot_file = head[:0x20] == BOOT_LOADER[:0x20]
     for i in range(keep_from, new_end):
         if head[i] != 0:
-            nonzero = i
-            break
-    return TargetCheck(vk, parts, new_end, write_end, ex, nonzero)
+            if boot_file:
+                residue += 1
+            elif nonzero is None:
+                nonzero = i
+                break
+    return TargetCheck(vk, parts, new_end, write_end, ex, nonzero, residue)
 
 
 # ---------------------------------------------------------------------------
@@ -960,6 +968,9 @@ def _update_locked(f, target, inputs, sys_bin, unit, backup, force, dry_run, out
               " 。新しい方が短いので残りを 0 で消します" if chk.write_end > chk.new_end else ""), file=out)
     else:
         print("前の起動部: IPL はあるが中身を確かめられません (前の起動部として扱いません)", file=out)
+    if chk.residue:
+        print("残り      : 前の起動部の後ろの残り %d バイトも上書きします (IPL が読む起動ファイルの範囲の中)"
+              % chk.residue, file=out)
     if chk.nonzero_gap is not None:
         msg = "起動部を書く範囲の %d バイト目に 0 でないデータがあります" % chk.nonzero_gap
         if not force:

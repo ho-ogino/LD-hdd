@@ -496,12 +496,43 @@ class TestUpdate(unittest.TestCase):
         with open(v, "r+b") as f:
             f.seek(0x200 + old_n)
             f.write(b"\x42")
-        self.assert_refused(v)
-        # 番兵を消せば通る
+        # 起動セクタが LSX-DodgersHD の IPL なので、0xF000 までは起動ファイルの範囲。--force なしで上書きし、残りを知らせる
+        out = io.StringIO()
+        ldhdd.update(v, self.inputs, backup=False, out=out)
+        self.assertIn("残り 1 バイト", out.getvalue())
+        self.assertEqual(read(v)[0x200:0x200 + len(ldhdd.makesys(self.ld161, self.com))], ldhdd.makesys(self.ld161, self.com))
+
+    def test_gap_residue_needs_exact_ipl_fcb(self):
+        # IPL 用 FCB が 1 バイトでも違えば (例: size が F000 でない)、今までどおり --force が要る
+        small_ld = fake_ld_bin(top=0xE000, body_len=0x1000)
+        v = self.vhd()
+        self.quiet_update(v, inputs_from(small_ld, self.com), backup=False)
+        old_n = len(ldhdd.makesys(small_ld, self.com))
         with open(v, "r+b") as f:
             f.seek(0x200 + old_n)
-            f.write(b"\x00")
-        self.quiet_update(v, backup=False)
+            f.write(b"\x42")
+            f.seek(0x12)
+            f.write(b"\x00\xe0")  # size = E000
+        self.assert_refused(v)
+        self.quiet_update(v, backup=False, force=True)
+
+    def test_legacy_residue_after_old_payload(self):
+        # 旧手順で何度か更新したイメージ: 既知の起動部の後ろに、さらに前の長い起動部の残りがある
+        comb = ldhdd.files_from_d88(MKLDHD)["LD.BIN"]  # 1.61b + HDD.COM 0.14 (11117 バイト)
+        files1 = ldhdd.files_from_d88(MKLDHD1)
+        v = self.vhd()
+        with open(v, "r+b") as f:
+            mbr = f.read(512)
+            f.seek(0)
+            f.write(ldhdd.boot_record(mbr) + comb + b"\x5a" * 224)
+        before_tail = read(v)[0x200 + len(comb) + 16:0x200 + len(comb) + 224]
+        out = io.StringIO()
+        inner = files1["LD.BIN"][135 + len(files1["HDD1.COM"]):]
+        ldhdd.update(v, inputs_from(inner, files1["HDD1.COM"]), backup=False, out=out)  # 11133 バイトの版
+        self.assertIn("残り 16 バイト", out.getvalue())
+        after = read(v)
+        self.assertEqual(after[0x200:0x200 + 11133], ldhdd.makesys(inner, files1["HDD1.COM"]))
+        self.assertEqual(after[0x200 + len(comb) + 16:0x200 + len(comb) + 224], before_tail)
 
     def test_disk_signature_kept(self):
         v = self.vhd()
@@ -566,11 +597,10 @@ class TestUpdate(unittest.TestCase):
             f.seek(0)
             head = f.read(0xF000)
         self.assertEqual(ldhdd.existing_boot(head), ldhdd.ExistingBoot(True, 0))
-        # 確かめられない前の起動部は「知らないデータ」なので、短い版でも --force が要る
+        # 確かめられない前の起動部は長さを信じない。起動ファイルの範囲なので短い版は --force なしで書けるが、
+        # 消すのは新しい起動部の範囲だけで、後ろの番兵は残る
         tiny = fake_ld_bin(top=0xE800, body_len=0x800)
-        self.assert_refused(v, inputs_from(tiny, self.com))
-        # --force でも、消すのは新しい起動部の範囲だけで、後ろの番兵は残る
-        self.quiet_update(v, inputs_from(tiny, self.com), backup=False, force=True)
+        self.quiet_update(v, inputs_from(tiny, self.com), backup=False)
         self.assertEqual(read(v)[0x200 + old_n:0x200 + old_n + 9], b"\x5a" * 9)
 
     def test_same_end_shift_not_trusted(self):
@@ -592,8 +622,7 @@ class TestUpdate(unittest.TestCase):
             head = f.read(0xF000)
         self.assertEqual(ldhdd.existing_boot(head), ldhdd.ExistingBoot(True, 0))
         tiny = fake_ld_bin(top=0xE800, body_len=0x800)
-        self.assert_refused(v, inputs_from(tiny, self.com))
-        self.quiet_update(v, inputs_from(tiny, self.com), backup=False, force=True)
+        self.quiet_update(v, inputs_from(tiny, self.com), backup=False)
         self.assertEqual(read(v)[0x200 + old_n:0x200 + old_n + 9], b"\x5a" * 9)
 
     def test_legacy_known_payload_trusted(self):
@@ -613,7 +642,8 @@ class TestUpdate(unittest.TestCase):
         n_small = 0x200 + len(ldhdd.makesys(small, self.com))
         self.assertEqual(read(v)[n_small:0x200 + len(comb)], bytes(0x200 + len(comb) - n_small))
 
-    def test_legacy_unknown_payload_needs_force(self):
+    def test_legacy_unknown_payload_in_boot_file(self):
+        # 既知でない起動部でも、起動セクタが LSX-DodgersHD の IPL なら起動ファイルの範囲として書ける
         comb = bytearray(ldhdd.files_from_d88(MKLDHD)["LD.BIN"])
         comb[200] ^= 0xFF  # COM の中身を 1 バイト変える (形は MAKESYS のまま)
         v = self.vhd()
@@ -621,8 +651,9 @@ class TestUpdate(unittest.TestCase):
             mbr = f.read(512)
             f.seek(0)
             f.write(ldhdd.boot_record(mbr) + bytes(comb))
-        self.assert_refused(v)
-        self.quiet_update(v, backup=False, force=True)
+        out = io.StringIO()
+        ldhdd.update(v, self.inputs, backup=False, out=out)
+        self.assertIn("残り", out.getvalue())
 
     def write_part_bpb(self, v, bpb):
         with open(v, "r+b") as f:
