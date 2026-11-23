@@ -866,30 +866,92 @@ class TestUpdate(unittest.TestCase):
             ldhdd.os.link = orig
         self.assertEqual(sha(os.path.join(real1, "t.vhd")), before)
 
-    def test_windows_backup_move(self):
-        # Windows の名前付けは MoveFileExW(WRITE_THROUGH、REPLACE_EXISTING なし)
-        class FakeKernel32:
-            def __init__(self):
-                self.calls = []
+    class FakeKernel32:
+        """MoveFileExW の偽物。MOVEFILE_REPLACE_EXISTING (0x1) が立っていれば置き換える"""
+        def __init__(self, after_move=None):
+            self.calls = []
+            self.after_move = after_move
 
-            def MoveFileExW(self, src, dst, flags):
-                self.calls.append(flags)
-                if os.path.exists(dst):
-                    return 0
-                os.rename(src, dst)
-                return 1
+        def MoveFileExW(self, src, dst, flags):
+            self.calls.append(flags)
+            if os.path.exists(dst) and not flags & 0x1:
+                return 0
+            os.replace(src, dst)
+            if self.after_move:
+                self.after_move(dst)
+            return 1
+
+    def test_windows_backup_move(self):
+        # Windows の名前付けは MoveFileExW(MOVEFILE_WRITE_THROUGH = 0x8 のみ。REPLACE_EXISTING = 0x1 は付けない)
         v = self.vhd()
-        k = FakeKernel32()
+        k = self.FakeKernel32()
         dst = os.path.join(self.dir, "w.bak")
         with open(v, "rb") as f:
             self.assertEqual(ldhdd._make_backup_windows(f, v, dst, kernel32=k), dst)
-        self.assertEqual(k.calls, [ldhdd.MOVEFILE_WRITE_THROUGH])
+        self.assertEqual(k.calls, [0x8])
         self.assertEqual(read(dst), read(v))
-        # 既にある名前には失敗し、仮ファイルは残らない
+        # 既にある名前には失敗し (置き換えるフラグなら、ここで置き換わってテストが落ちる)、仮ファイルは残らない
+        with open(dst, "wb") as f:
+            f.write(b"keep")
         with open(v, "rb") as f:
             with self.assertRaises(ldhdd.LdhddError):
                 ldhdd._make_backup_windows(f, v, dst, kernel32=k)
+        self.assertEqual(read(dst), b"keep")
         self.assertEqual(sorted(os.listdir(self.dir)), ["t.vhd", "w.bak"])
+
+    def test_windows_backup_path_changed(self):
+        # 名前を付けた後に、戻し先のパスが別の物を指すようになったら止める (親の付け替えの代わり)
+        def swap(dst):
+            os.replace(dst, dst + ".moved")
+            with open(dst, "wb") as f:
+                f.write(b"other")
+        v = self.vhd()
+        k = self.FakeKernel32(after_move=swap)
+        with open(v, "rb") as f:
+            with self.assertRaisesRegex(ldhdd.LdhddError, "別の物を指しています"):
+                ldhdd._make_backup_windows(f, v, os.path.join(self.dir, "w.bak"), kernel32=k)
+
+    @unittest.skipIf(os.name == "nt", "ハードリンクのテスト")
+    def test_backup_entry_replaced_after_link(self):
+        # 正式な名前を付けた直後に、その名前が別のファイルに置き換えられたら、イメージに書かずに止める
+        v = self.vhd()
+        before = sha(v)
+        orig = ldhdd.os.link
+
+        def link(a, b, **kw):
+            r = orig(a, b, **kw)
+            p = os.path.join(self.dir, b)
+            os.unlink(p)
+            with open(p, "wb") as f:
+                f.write(b"other")
+            return r
+        ldhdd.os.link = link
+        try:
+            with self.assertRaisesRegex(ldhdd.LdhddError, "別の物を指しています"):
+                self.quiet_update(v)
+        finally:
+            ldhdd.os.link = orig
+        self.assertEqual(sha(v), before)
+
+    @unittest.skipIf(os.name == "nt", "シンボリックリンクのテスト")
+    def test_backup_next_to_image_with_symlink_dotdot(self):
+        # lnk -> a/b のとき、lnk/../t.vhd はカーネルでは a/t.vhd。バックアップも a/ にできること
+        a = os.path.join(self.dir, "a")
+        os.makedirs(os.path.join(a, "b"))
+        make_vhd(os.path.join(a, "t.vhd"))
+        os.symlink(os.path.join(a, "b"), os.path.join(self.dir, "lnk"))
+        v = os.path.join(self.dir, "lnk", "..", "t.vhd")
+        bak = self.quiet_update(v)
+        self.assertTrue(os.path.samefile(os.path.dirname(bak), a))
+        self.assertEqual([x for x in os.listdir(a) if x.endswith(".bak")], [os.path.basename(bak)])
+        self.assertEqual([x for x in os.listdir(self.dir) if x.endswith(".bak")], [])
+
+    def test_long_image_name(self):
+        # 名前の長さの上限 (255 バイト) 近くの名前でも、仮ファイルの名前が長くなりすぎない
+        name = "x" * 226 + ".vhd"
+        v = self.vhd(name)
+        bak = self.quiet_update(v)
+        self.assertTrue(os.path.exists(bak))
 
     @unittest.skipIf(os.name == "nt", "flock のテスト")
     def test_locked_by_other_process(self):

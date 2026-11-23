@@ -763,27 +763,40 @@ def make_backup(f, path: str) -> str:
 _BACKUP_FAIL = "バックアップを作れませんでした (%s)。何も書き込んでいません"
 _NO_LINK = ("このファイルシステムでは、既にある物を置き換えずにバックアップを置けません"
             " (自分でコピーを取ってから --no-backup を付けてください)")
+_BACKUP_UNSURE = ("バックアップ %s を確かめられませんでした (%s)。イメージには何も書き込んでいません"
+                  " (バックアップはできているかもしれません)")
 
 
-def _copy_to_fd(f, fd: int) -> None:
-    with os.fdopen(fd, "wb") as out:
+def _backup_dir(dst: str) -> str:
+    # abspath は「..」を文字の上だけでたたむので使わない。カーネルが対象のパスをたどるのと同じたどり方をさせる
+    return os.path.dirname(dst) or os.curdir
+
+
+def _staging_name() -> str:
+    return ".ldhdd-%d-%s.part" % (os.getpid(), os.urandom(4).hex())
+
+
+def _copy_to_fd(f, fd: int) -> os.stat_result:
+    """f の中身を fd に写して同期し、写した先の同一性 (fstat) を返す。fd は閉じない"""
+    with os.fdopen(fd, "wb", closefd=False) as out:
         shutil.copyfileobj(f, out, 1024 * 1024)
         out.flush()
-        os.fsync(out.fileno())
+    os.fsync(fd)
+    return os.fstat(fd)
 
 
 def _make_backup_posix(f, path: str, dst: str) -> str:
-    """親ディレクトリを 1 回だけ開き、仮ファイルの作成・名前付け・後始末・同期をすべてその記述子で行う
-    (途中で親のパスが別の場所を指すようになっても、同じディレクトリで済ませる)"""
-    dirpath = os.path.dirname(os.path.abspath(dst))
+    """親ディレクトリを 1 回だけ開き、仮ファイルの作成・名前付け・後始末・同期をすべてその記述子で行う。
+    仮ファイルの記述子も開いたまま持ち、その同一性で、正式な名前と表示する戻し先のパスを確かめる。"""
     name = os.path.basename(dst)
-    dfd = os.open(dirpath, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    dfd = os.open(_backup_dir(dst), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
     staging = None
+    fd = None
     leftover = None
     try:
         try:
             for _ in range(100):
-                cand = "%s.%d.%s.part" % (name, os.getpid(), os.urandom(4).hex())
+                cand = _staging_name()
                 try:
                     fd = os.open(cand, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=dfd)
                 except FileExistsError:
@@ -792,7 +805,7 @@ def _make_backup_posix(f, path: str, dst: str) -> str:
                 break
             else:
                 raise OSError("仮ファイルの名前を決められません")
-            _copy_to_fd(f, fd)
+            staged = _copy_to_fd(f, fd)
             try:
                 os.link(staging, name, src_dir_fd=dfd, dst_dir_fd=dfd, follow_symlinks=False)
             except OSError as e:
@@ -809,18 +822,19 @@ def _make_backup_posix(f, path: str, dst: str) -> str:
         try:
             os.unlink(staging, dir_fd=dfd)
         except OSError:
-            leftover = os.path.join(dirpath, staging)
+            leftover = os.path.join(_backup_dir(dst), staging)
         try:
             # 名前 (ディレクトリの項目) をディスクに書き切ってから、イメージに書き始める
             os.fsync(dfd)
-            # 表示する戻し先のパスが、今作ったバックアップを指していること
-            published = os.stat(name, dir_fd=dfd, follow_symlinks=False)
-            if not os.path.samestat(published, os.stat(dst)):
+            # 正式な名前と、表示する戻し先のパスが、今書いて同期したファイルそのものを指していること
+            if not (os.path.samestat(os.stat(name, dir_fd=dfd, follow_symlinks=False), staged)
+                    and os.path.samestat(os.stat(dst), staged)):
                 raise OSError("バックアップのパス %s が別の物を指しています" % dst)
         except OSError as e:
-            raise LdhddError("バックアップ %s の名前をディスクに書き切れませんでした (%s)。イメージには何も書き込んでいません"
-                             " (バックアップはできているかもしれません)" % (dst, e))
+            raise LdhddError(_BACKUP_UNSURE % (dst, e))
     finally:
+        if fd is not None:
+            os.close(fd)
         os.close(dfd)
     if leftover:
         # 正式な名前のバックアップはできている。仮の名前が消せなかっただけ
@@ -845,9 +859,11 @@ def _windows_move_no_replace(src: str, dst: str, kernel32=None) -> None:
 def _make_backup_windows(f, path: str, dst: str, kernel32=None) -> str:
     tmp = None
     try:
-        fd, tmp = tempfile.mkstemp(prefix=os.path.basename(path) + ".", suffix=".part",
-                                   dir=os.path.dirname(os.path.abspath(dst)))
-        _copy_to_fd(f, fd)
+        fd, tmp = tempfile.mkstemp(prefix=".ldhdd-", suffix=".part", dir=_backup_dir(dst))
+        try:
+            staged = _copy_to_fd(f, fd)
+        finally:
+            os.close(fd)
         _windows_move_no_replace(tmp, dst, kernel32)
         tmp = None
     except OSError as e:
@@ -857,6 +873,12 @@ def _make_backup_windows(f, path: str, dst: str, kernel32=None) -> str:
             except OSError:
                 pass
         raise LdhddError(_BACKUP_FAIL % e)
+    try:
+        # 表示する戻し先のパスが、今書いて同期したファイルそのものを指していること
+        if not os.path.samestat(os.stat(dst), staged):
+            raise OSError("バックアップのパス %s が別の物を指しています" % dst)
+    except OSError as e:
+        raise LdhddError(_BACKUP_UNSURE % (dst, e))
     return dst
 
 
