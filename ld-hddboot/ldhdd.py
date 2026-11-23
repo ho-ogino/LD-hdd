@@ -1692,7 +1692,10 @@ def scan_host(paths: List[str], skip_dotfiles: bool) -> Tuple[List[HostNode], Li
     """ホストのファイル・フォルダを読む。(木, 名前のエラー, 飛ばした物)"""
     errors, skipped = [], []
 
-    def node(path: str, name: str, top: bool) -> Optional[HostNode]:
+    def node(path: str, name: str, top: bool, depth: int = 0) -> Optional[HostNode]:
+        if depth > MAX_DEPTH:
+            errors.append("%s: フォルダが深すぎます (%d 段まで)" % (path, MAX_DEPTH))
+            return None
         if name.startswith(".") and not top and skip_dotfiles:
             skipped.append(path)
             return None
@@ -1708,7 +1711,7 @@ def scan_host(paths: List[str], skip_dotfiles: bool) -> Tuple[List[HostNode], Li
         if os.path.isdir(path):
             kids = []
             for entry in sorted(os.listdir(path)):
-                k = node(os.path.join(path, entry), entry, False)
+                k = node(os.path.join(path, entry), entry, False, depth + 1)
                 if k is not None:
                     kids.append(k)
             seen = {}
@@ -1755,6 +1758,19 @@ def _ceil(a: int, b: int) -> int:
     return (a + b - 1) // b
 
 
+MAX_DEPTH = 64  # フォルダの深さの上限 (LSX-Dodgers のパスの長さにも十分)
+
+
+def _host_depth(n: HostNode) -> int:
+    depth = 0
+    stack = [(n, 1)]
+    while stack:
+        x, d = stack.pop()
+        depth = max(depth, d)
+        stack.extend((k, d + 1) for k in x.children if k.is_dir)
+    return depth
+
+
 def plan_add(vol: FatVolume, nodes: List[HostNode], to_path: str, overwrite: bool) -> AddPlan:
     """書く前に、ぶつかり・容量・項目の数を全部決める"""
     plan = AddPlan()
@@ -1763,7 +1779,10 @@ def plan_add(vol: FatVolume, nodes: List[HostNode], to_path: str, overwrite: boo
     # 入れる先のフォルダ (無ければ作る)
     target: Tuple[str, object] = ("existing", 0)  # ("existing", cluster) / ("new", NewDir)
     shown = "/"
-    for part in [p for p in to_path.replace("\\", "/").split("/") if p]:
+    parts = [p for p in to_path.replace("\\", "/").split("/") if p]
+    if len(parts) + max([_host_depth(n) for n in nodes] or [0]) > MAX_DEPTH:
+        raise LdhddError("フォルダが深すぎます (入れる先と合わせて %d 段まで)" % MAX_DEPTH)
+    for part in parts:
         n11 = to_short_name(part)
         shown = shown.rstrip("/") + "/" + short_to_text(n11)
         if target[0] == "existing":
@@ -1961,6 +1980,7 @@ def execute_add(vol: FatVolume, plan: AddPlan) -> None:
     marker_by_dir: Dict[int, Optional[int]] = {}
 
     detached_by_dir: Dict[int, Dict[int, List[int]]] = {}
+    ext_slots: set = set()  # 伸ばしたディレクトリの新しいクラスタの項目 (0 で埋めてから使う)
     inval_writes: Dict[int, bytes] = {}
 
     def ensure_listing(cl: int) -> None:
@@ -1988,6 +2008,7 @@ def execute_add(vol: FatVolume, plan: AddPlan) -> None:
             vol.set(last, c)
             data_writes.append((vol.cluster_off(c), bytes(vol.csize)))
             new_slots = [vol.cluster_off(c) + i * 32 for i in range(vol.csize // 32)]
+            ext_slots.update(new_slots)
             trailing = detached_by_dir[cl].pop(TRAILING_LFN, None)
             if trailing:
                 detached_by_dir[cl][new_slots[0]] = trailing
@@ -2068,7 +2089,8 @@ def execute_add(vol: FatVolume, plan: AddPlan) -> None:
                          key=lambda o: order.get(o, (2, -1, o))[1:]))
     writes = dict(inval_writes)
     writes.update(entry_writes)
-    originals = {o: _read_at(f, o, 32) for o in writes}
+    # 伸ばした先の項目は 0 で埋めた状態が元 (今そこにある古いバイトには戻さない)
+    originals = {o: (bytes(32) if o in ext_slots else _read_at(f, o, 32)) for o in writes}
 
     # 1. データ (伸ばしたディレクトリのクラスタの 0 埋めを含む)。FAT でつなぐ前に同期する
     for off, data in data_writes:
@@ -2092,9 +2114,10 @@ def execute_add(vol: FatVolume, plan: AddPlan) -> None:
                 f.seek(o)
                 _write_all(f, writes[o])
             os.fsync(f.fileno())
-        for o, data in writes.items():
-            if _read_at(f, o, 32) != data:
-                raise LdhddError("書いたディレクトリ項目を読み戻したら一致しませんでした")
+            # 次の段に進む前に (今の終わりの印を上書きする前に) この段の書き込みを読み戻して確かめる
+            for o in ph:
+                if _read_at(f, o, 32) != writes[o]:
+                    raise LdhddError("書いたディレクトリ項目を読み戻したら一致しませんでした")
     except BaseException:
         restored = True
         for o in reversed(written):

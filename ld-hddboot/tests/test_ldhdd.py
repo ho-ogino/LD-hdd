@@ -2363,6 +2363,138 @@ class TestAdd(unittest.TestCase):
         finally:
             f.close()
 
+    def full_dir_with_stale_extension(self):
+        path = self.vhd()
+        for i in range(126):
+            self.put(os.path.join("FULL", "F%d.TXT" % i), b"%d" % i)
+        self.add(path, [os.path.join(self.src, "FULL")])
+        f0, vol0 = self.open_vol(path)
+        csize = vol0.csize
+        ext_off = vol0.cluster_off(vol0.free_clusters()[1])
+        free0 = len(vol0.free_clusters())
+        f0.close()
+        with open(path, "r+b") as fh:
+            fh.seek(ext_off)
+            fh.write(ldhdd.make_dir_entry(b"STALE   TXT", 0x20, 2, 0, time.time()) * (csize // 32))
+        return path, ext_off, csize, free0
+
+    def test_growth_rollback_does_not_restore_stale(self):
+        path, ext_off, csize, free0 = self.full_dir_with_stale_extension()
+        orig = ldhdd._write_all
+        state = {"failed": False}
+
+        def fail(fh, d):
+            if len(d) == 32 and not state["failed"]:
+                state["failed"] = True
+                raise OSError(5, "injected")
+            return orig(fh, d)
+        ldhdd._write_all = fail
+        try:
+            self.put(os.path.join("MORE", "FULL", "X.TXT"), b"x")
+            with self.assertRaisesRegex(ldhdd.LdhddError, "injected"):
+                self.add(path, [os.path.join(self.src, "MORE", "FULL")])
+        finally:
+            ldhdd._write_all = orig
+        # 戻した後の伸ばした先は 0 (古い項目に戻っていない)
+        self.assertEqual(read(path)[ext_off:ext_off + csize], bytes(csize))
+        f, vol = self.open_vol(path)
+        try:
+            vol.walk_check()
+            self.assertEqual(len(vol.free_clusters()), free0)
+        finally:
+            f.close()
+
+    def test_dropped_marker_write_never_exposes_stale(self):
+        path, slots = self.stale_fixture()
+        orig_w, orig_s = ldhdd._write_all, ldhdd.os.fsync
+        state = {"dropped": False}
+        seen = []
+
+        def drop(fh, d):
+            if len(d) == 32 and d[0] == 0 and not state["dropped"]:
+                state["dropped"] = True
+                return None  # 成功を返したが書いていない
+            return orig_w(fh, d)
+
+        def sync(fd):
+            orig_s(fd)
+            raw = read(path)
+            if raw[slots[1]] != 0 and raw[slots[2]:slots[2] + 5] == b"STALE":
+                seen.append(True)  # 古い項目が見えている状態で同期した
+        ldhdd._write_all, ldhdd.os.fsync = drop, sync
+        try:
+            with self.assertRaisesRegex(ldhdd.LdhddError, "一致しません"):
+                self.add(path, [self.put("B.TXT", b"b")])
+        finally:
+            ldhdd._write_all, ldhdd.os.fsync = orig_w, orig_s
+        self.assertEqual(seen, [])
+        run_main(["ls", path])
+        self.assertNotIn("STALE", run_main.out)
+
+    def test_fat_mirror_readback_mismatch_restores(self):
+        for phase in ("alloc", "cleanup"):
+            path = self.vhd(name="rb_%s.vhd" % phase)
+            self.add(path, [self.put("A.TXT", b"old" * 3000)])
+            f, vol = self.open_vol(path)
+            free0, fat_bytes = len(vol.free_clusters()), vol.fat_bytes
+            f.close()
+            p2 = os.path.join(self.dir, "rb", phase, "A.TXT")
+            os.makedirs(os.path.dirname(p2))
+            with open(p2, "wb") as fh:
+                fh.write(b"new" * 5000)
+            orig = ldhdd._write_all
+            state = {"n": 0}
+            target_call = 2 if phase == "alloc" else 4
+
+            def skip(fh, d):
+                if len(d) == fat_bytes:
+                    state["n"] += 1
+                    if state["n"] == target_call:
+                        return None  # 2 つ目の写しを書いたふりをする
+                return orig(fh, d)
+            ldhdd._write_all = skip
+            try:
+                with self.assertRaisesRegex(ldhdd.LdhddError, "一致しません"):
+                    self.add(path, [p2], overwrite=True)
+            finally:
+                ldhdd._write_all = orig
+            f, vol = self.open_vol(path)
+            try:
+                vol.walk_check()
+                if phase == "alloc":
+                    self.assertEqual(vol_read_file(vol, "/A.TXT"), b"old" * 3000)
+                    self.assertEqual(len(vol.free_clusters()), free0)
+                else:
+                    self.assertEqual(vol_read_file(vol, "/A.TXT"), b"new" * 5000)
+            finally:
+                f.close()
+
+    def test_snapshot_read_failure_leaves_image(self):
+        path = self.vhd()
+        self.add(path, [self.put("A.TXT", b"a")])
+        orig_plan, orig_read = ldhdd.plan_add, ldhdd._read_at
+        state = {"armed": False}
+
+        def plan(*a, **kw):
+            r = orig_plan(*a, **kw)
+            state["armed"] = True
+            return r
+
+        def rd(fh, off, n):
+            if state["armed"] and n == 32:
+                raise OSError(5, "injected")
+            return orig_read(fh, off, n)
+        ldhdd.plan_add, ldhdd._read_at = plan, rd
+        try:
+            self.assert_refused(path, [self.put("B.TXT", b"b")], "injected")
+        finally:
+            ldhdd.plan_add, ldhdd._read_at = orig_plan, orig_read
+
+    def test_too_deep_refused(self):
+        path = self.vhd()
+        p = self.put("X.TXT", b"x")
+        self.assert_refused(path, [p], "深すぎます", to_path="/" + "/".join("D%d" % i for i in range(70)))
+
     def test_timestamps(self):
         path = self.vhd()
         p = self.put("T.TXT", b"t")
