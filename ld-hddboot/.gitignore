@@ -1,0 +1,9 @@
+# 作業で出来るディスクイメージや中間ファイルを誤って commit しないため
+*.vhd
+*.VHD
+*.bak
+*.bak.*
+/LD.BIN
+/ldsys.d88
+/ldhdd_boot.bin
+__pycache__/
