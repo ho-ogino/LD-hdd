@@ -52,7 +52,10 @@ def read(path):
 
 def fake_ld_bin(top=0xD100, body_len=9721, exec_off=7, fill=0x5A):
     end = top + body_len
-    body = bytes([fill]) * body_len
+    body = bytearray([fill]) * body_len
+    if exec_off + 8 < body_len:
+        body[exec_off + 6:exec_off + 9] = b"\xcd\x58\xd1"  # 初期化の CALL (MAKESYS が差し替える)
+    body = bytes(body)
     return bytes([0xFE]) + struct.pack("<HHH", top, end, top + exec_off) + body
 
 
@@ -259,6 +262,16 @@ class TestMakesys(unittest.TestCase):
         ldhdd.makesys(fake_ld_bin(top=0xFF51 - 0x2000, body_len=0x2000), b"\xc9")
         with self.assertRaisesRegex(ldhdd.LdhddError, "作業場所"):
             ldhdd.makesys(fake_ld_bin(top=0xFF52 - 0x2000, body_len=0x2000), b"\xc9")
+
+    def test_needs_init_call(self):
+        ld = bytearray(fake_ld_bin())
+        ld[7 + 7 + 6] = 0x00  # exec+6 の CALL を消す
+        with self.assertRaisesRegex(ldhdd.LdhddError, "CALL"):
+            ldhdd.makesys(bytes(ld), b"\xc9")
+        # 実行番地が終わりの直前 (CALL の飛び先が LD.BIN の外)
+        short = fake_ld_bin(top=0xD100, body_len=0x100, exec_off=0x100 - 2)
+        with self.assertRaisesRegex(ldhdd.LdhddError, "CALL"):
+            ldhdd.makesys(short, b"\xc9")
 
     def test_com_overwrites_stub(self):
         with self.assertRaises(ldhdd.LdhddError):
@@ -645,6 +658,61 @@ class TestUpdate(unittest.TestCase):
         self.assertEqual(sha(v), before)
         self.assertEqual(os.listdir(self.dir), ["t.vhd"])
 
+    def test_data_start_wrap_refused(self):
+        # ルートの位置 (65535) と ADDCL16 (65528) は 16 ビットに収まるが、データ領域の位置が 65536 になる
+        lba = 128
+        count = 65536 + 4 * 128
+        v = self.vhd("wrap.vhd", sectors=lba + count, parts=((0x06, lba, count),))
+        bpb = bpb_sector(count, spc=4, root=16, spf=32767)
+        self.write_part_bpb(v, bpb)
+        with self.assertRaisesRegex(ldhdd.LdhddError, "データ領域の位置"):
+            self.quiet_update(v, backup=False)
+        # 1 つ手前 (データ領域の位置 65534) は通る
+        ldhdd.check_fat_bpb(bpb_sector(count, spc=4, root=16, spf=32766), count)
+
+    def test_unbuffered_target_and_failure_hint(self):
+        v = self.vhd()
+        with ldhdd._open_target(v, True) as f:
+            self.assertIsInstance(f, io.FileIO)  # 閉じる時に書き直すバッファが無い
+        orig = ldhdd.os.fsync
+        calls = []
+
+        def fsync(fd):
+            calls.append(fd)
+            if len(calls) >= 2:  # 1 回目はバックアップ、2 回目は対象
+                raise OSError(5, "I/O error")
+            return orig(fd)
+        ldhdd.os.fsync = fsync
+        try:
+            with self.assertRaises(ldhdd.LdhddError) as cm:
+                self.quiet_update(v)
+        finally:
+            ldhdd.os.fsync = orig
+        baks = [x for x in os.listdir(self.dir) if x.endswith(".bak")]
+        self.assertEqual(len(baks), 1)
+        self.assertIn(os.path.join(self.dir, baks[0]), str(cm.exception))
+        self.assertIn("戻してください", str(cm.exception))
+
+    def test_backup_never_replaces_or_deletes(self):
+        v = self.vhd()
+        existing = os.path.join(self.dir, "t.vhd.taken.bak")
+        stray = os.path.join(self.dir, "t.vhd.taken.bak.part")
+        for p in (existing, stray):
+            with open(p, "wb") as f:
+                f.write(b"keep")
+        orig = ldhdd._backup_path
+        ldhdd._backup_path = lambda path: existing
+        try:
+            before = sha(v)
+            with self.assertRaisesRegex(ldhdd.LdhddError, "バックアップを作れません"):
+                self.quiet_update(v)
+        finally:
+            ldhdd._backup_path = orig
+        self.assertEqual(sha(v), before)
+        self.assertEqual(read(existing), b"keep")
+        self.assertEqual(read(stray), b"keep")
+        self.assertEqual(sorted(os.listdir(self.dir)), ["t.vhd", "t.vhd.taken.bak", "t.vhd.taken.bak.part"])
+
     @unittest.skipIf(os.name == "nt", "flock のテスト")
     def test_locked_by_other_process(self):
         import subprocess
@@ -779,9 +847,10 @@ class TestDpbLimits(unittest.TestCase):
             data_start = 1 + 2 * spf + 512 * 32 // 2048
             return bpb_sector(data_start + 100, bps=2048, spc=1, root=512, spf=spf)
         big = 40000 * 4
-        self.check(bpb(16380), big)
+        # データ領域の位置 (1 + 2*spf + 8) を倍にして 16 ビットに収まるのは spf=16379 まで
+        self.check(bpb(16379), big)
         with self.assertRaisesRegex(ldhdd.LdhddError, "データ領域の位置"):
-            self.check(bpb(16381), big)
+            self.check(bpb(16380), big)
 
     def test_root_dir_sectors(self):
         with self.assertRaisesRegex(ldhdd.LdhddError, "ルートディレクトリ"):

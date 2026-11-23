@@ -20,12 +20,14 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import errno
 import hashlib
 import os
 import re
 import shutil
 import struct
 import sys
+import tempfile
 from typing import Dict, List, NamedTuple, Optional, Tuple
 
 __version__ = "1.0.0"
@@ -347,6 +349,10 @@ def makesys(ld_bin: bytes, com: bytes, unit: int = 0, drive: int = STUB_DRIVE) -
     ld = parse_msx_bin(ld_bin)
     if len(com) < 1:
         raise LdhddError("COM が空です")
+    # スタブは LD.BIN の初期化の CALL (exec+6) の飛び先 (exec+7, +8) を差し替える
+    hook = 7 + (ld.exec + 6 - ld.top)
+    if ld.exec + 9 > ld.end or ld_bin[hook] != 0xCD:
+        raise LdhddError("LD.BIN の実行番地 %04X の 6 バイト先に CALL (CD) がありません。MAKESYS が対応している LD.BIN ではありません" % ld.exec)
     stub, tss_pos, drive_pos = build_stub(unit)
     s = len(stub)
     c = len(com)
@@ -493,8 +499,9 @@ def check_fat_bpb(sec: bytes, part_sectors: int, read_part=None) -> None:
     if (res + nf * spf) * k > 0xFFFF or tot >= (1 << 24):
         raise LdhddError("第 1 パーティションの BPB: FAT か総セクタ数が大きすぎます")
     data_start = res + nf * spf + dir_secs
-    # DPB_14_ADDCL16 = データ領域の位置 - 2 クラスタ (16 ビット。2048 バイトのセクタでは倍にされる)
-    if not 0 <= (data_start - 2 * spc) * k <= 0xFFFF:
+    # BPB2DPB はデータ領域の位置 (DIRPS + DIRSCNT) を 16 ビットで計算し、
+    # DPB_14_ADDCL16 = データ領域の位置 - 2 クラスタ も 16 ビット (2048 バイトのセクタではどちらも倍にされる)
+    if not (data_start * k <= 0xFFFF and 0 <= (data_start - 2 * spc) * k <= 0xFFFF):
         raise LdhddError("第 1 パーティションの BPB: データ領域の位置 (%d セクタ) が HDD.COM の DPB に入りません" % data_start)
     clusters = (tot - data_start) // spc if tot > data_start else 0
     if not 1 <= clusters < 65525:
@@ -548,8 +555,24 @@ def vhd_checksum(footer: bytes) -> int:
 
 
 def _read_at(f, off: int, n: int) -> bytes:
+    """off から n バイト (ファイルの終わりまで) を読む。バッファなしのファイルでも全部読む"""
     f.seek(off)
-    return f.read(n)
+    out = bytearray()
+    while len(out) < n:
+        b = f.read(n - len(out))
+        if not b:
+            break
+        out += b
+    return bytes(out)
+
+
+def _write_all(f, data: bytes) -> None:
+    view = memoryview(data)
+    while view:
+        n = f.write(view)
+        if not n:
+            raise OSError("書き込めませんでした")
+        view = view[n:]
 
 
 def vhd_kind_of(f) -> VhdKind:
@@ -722,24 +745,44 @@ def make_backup(f, path: str) -> str:
     """開いているファイル f の中身を、path の隣に新しい名前でコピーする。
     仮の名前に書いて同期してから正式な名前にするので、途中で失敗しても正式な名前の物は残らない。"""
     dst = _backup_path(path)
-    tmp = dst + ".part"
+    tmp = None
     f.seek(0)
     try:
-        with open(tmp, "xb") as out:
+        # この呼び出しだけの仮ファイル (名前がぶつからない)
+        fd, tmp = tempfile.mkstemp(prefix=os.path.basename(path) + ".", suffix=".part",
+                                   dir=os.path.dirname(os.path.abspath(path)))
+        with os.fdopen(fd, "wb") as out:
             shutil.copyfileobj(f, out, 1024 * 1024)
             out.flush()
             os.fsync(out.fileno())
+        _publish_no_replace(tmp, dst)
+        tmp = None
+    except OSError as e:
+        if tmp is not None:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        raise LdhddError("バックアップを作れませんでした (%s)。何も書き込んでいません" % e)
+    return dst
+
+
+def _publish_no_replace(tmp: str, dst: str) -> None:
+    """tmp を dst という名前にする。dst が既にあれば失敗する (置き換えない)"""
+    if os.name == "nt":
+        os.rename(tmp, dst)  # Windows の rename は既にある名前には失敗する
+        return
+    try:
+        os.link(tmp, dst)  # 既にある名前には失敗する
+    except OSError as e:
+        if e.errno not in (errno.EPERM, errno.EOPNOTSUPP, errno.ENOTSUP, errno.EXDEV, errno.EMLINK):
+            raise
+        # ハードリンクが使えないファイルシステム: 名前を確かめてから rename
         if os.path.exists(dst):
             raise OSError("バックアップの名前 %s が既にあります" % dst)
         os.rename(tmp, dst)
-    except OSError as e:
-        try:
-            if os.path.exists(tmp):
-                os.remove(tmp)
-        except OSError:
-            pass
-        raise LdhddError("バックアップを作れませんでした (%s)。何も書き込んでいません" % e)
-    return dst
+        return
+    os.remove(tmp)
 
 
 def _lock_windows(f, msvcrt_mod):
@@ -782,7 +825,8 @@ def _lock(f, msvcrt_mod=None):
 def _open_target(target: str, write: bool):
     if not os.path.isfile(target):
         raise LdhddError("ファイルがありません: %s" % target)
-    return open(target, "r+b" if write else "rb")
+    # バッファなしで開く。閉じる時に、残ったバッファを (ロックを外した後に) 書き直すことが無いように
+    return open(target, "r+b" if write else "rb", buffering=0)
 
 
 def update(target: str, inputs: Inputs, unit: int = 0, backup: bool = True,
@@ -833,8 +877,7 @@ def _update_locked(f, target, inputs, sys_bin, unit, backup, force, dry_run, out
         print("バックアップ: %s" % bak, file=out)
     try:
         f.seek(0)
-        f.write(area)
-        f.flush()
+        _write_all(f, area)
         os.fsync(f.fileno())
         if _read_at(f, 0, len(area)) != area:
             raise LdhddError("書いた内容を読み戻したら一致しませんでした")
