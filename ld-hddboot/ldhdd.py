@@ -767,13 +767,15 @@ def make_backup(f, path: str) -> str:
             os.close(fd)
         leftover = _publish_no_replace(tmp, dst)
         tmp = None
-    except OSError as e:
+    except BaseException as e:  # Ctrl-C などでも仮ファイルを片付ける
         if tmp is not None:
             try:
                 os.remove(tmp)
             except OSError:
                 pass
-        raise LdhddError(_BACKUP_FAIL % e)
+        if isinstance(e, OSError):
+            raise LdhddError(_BACKUP_FAIL % e)
+        raise
     try:
         # 名前 (ディレクトリの項目) もディスクに書いてから、イメージに書き始める
         _fsync_dir(d)
@@ -786,6 +788,8 @@ def make_backup(f, path: str) -> str:
 
 
 _BACKUP_FAIL = "バックアップを作れませんでした (%s)。何も書き込んでいません"
+_NO_LINK = ("このファイルシステムでは、既にある物を置き換えずにバックアップを置けません。"
+            "自分でコピーを取ってから --no-backup を付けて実行してください")
 _BACKUP_UNSURE = ("バックアップ %s の名前をディスクに書き切れませんでした (%s)。イメージには何も書き込んでいません"
                   " (バックアップはできているかもしれません)")
 
@@ -799,9 +803,10 @@ _IS_WINDOWS = os.name == "nt"
 
 
 def _create_staging(d: str) -> Tuple[int, str]:
-    """d に仮ファイルを作る。tempfile.mkstemp は d を abspath でたたむので使わない"""
+    """d に仮ファイルを作る。tempfile.mkstemp は d を abspath でたたむので使わない。
+    名前 (17 文字) は正式な名前 (元の名前 + 20 文字以上) より必ず短くし、パスの長さの上限に先にかからないようにする"""
     for _ in range(100):
-        tmp = os.path.join(d, ".ldhdd-%d-%s.part" % (os.getpid(), os.urandom(4).hex()))
+        tmp = os.path.join(d, ".ldhdd%s.part" % os.urandom(3).hex())
         try:
             return os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o600), tmp
         except FileExistsError:
@@ -835,22 +840,13 @@ def _publish_no_replace(tmp: str, dst: str) -> Optional[str]:
         _windows_move_no_replace(tmp, dst)
         return None
     try:
-        os.link(tmp, dst)  # 既にある名前には失敗する
+        os.link(tmp, dst)  # 既にある名前には失敗する。途中で止まっても、正式な名前は全部できているか無いか
     except OSError as e:
-        if e.errno not in (errno.EPERM, errno.EOPNOTSUPP, errno.ENOTSUP, errno.EMLINK):
-            raise
-        # ハードリンクが使えないファイルシステム (FAT など): 先に正式な名前を O_EXCL で押さえ
-        # (既にあれば失敗する)、押さえた自分の空ファイルを仮ファイルで置き換える
-        os.close(os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
-        try:
-            os.rename(tmp, dst)
-        except OSError:
-            try:
-                os.remove(dst)
-            except OSError:
-                pass
-            raise
-        return None
+        if e.errno in (errno.EPERM, errno.EOPNOTSUPP, errno.ENOTSUP, errno.EMLINK):
+            # ハードリンクが使えないファイルシステム (Linux や macOS から見た FAT など)。
+            # 置き換えずに一度で名前を付ける方法が無いので、正式な名前を作る前に止める
+            raise OSError(e.errno, _NO_LINK)
+        raise
     try:
         os.remove(tmp)
     except OSError:

@@ -734,50 +734,50 @@ class TestUpdate(unittest.TestCase):
         self.assertEqual(read(v)[n_new:0x200 + len(old)], bytes(0x200 + len(old) - n_new))
 
     @unittest.skipIf(os.name == "nt", "ハードリンクのテスト")
-    def test_backup_without_hardlink_falls_back(self):
-        # ハードリンクが使えないファイルシステム (FAT など) でもバックアップを作れる。既にある名前は置き換えない
-        import errno as _errno
-        v = self.vhd()
-        orig_link, orig_path = ldhdd.os.link, ldhdd._backup_path
-
-        def nolink(a, b, **kw):
-            raise OSError(_errno.EPERM, "Operation not permitted")
-        ldhdd.os.link = nolink
-        try:
-            bak = self.quiet_update(v)
-            self.assertEqual(sorted(os.listdir(self.dir)), sorted(["t.vhd", os.path.basename(bak)]))
-            ldhdd._backup_path = lambda path: bak
-            before = sha(v)
-            with self.assertRaisesRegex(ldhdd.LdhddError, "バックアップを作れません"):
-                self.quiet_update(v)
-            self.assertEqual(sha(v), before)
-        finally:
-            ldhdd.os.link, ldhdd._backup_path = orig_link, orig_path
-        self.assertEqual(sorted(os.listdir(self.dir)), sorted(["t.vhd", os.path.basename(bak)]))
-
-    @unittest.skipIf(os.name == "nt", "ハードリンクのテスト")
-    def test_fallback_name_taken_during_publish(self):
-        # ハードリンクが使えない時も、名前を付ける直前にできた同じ名前の物は置き換えない
+    def test_backup_without_hardlink_stops(self):
+        # ハードリンクが使えないファイルシステムでは、正式な名前を作る前に止め、--no-backup を案内する
         import errno as _errno
         v = self.vhd()
         before = sha(v)
         orig_link = ldhdd.os.link
-        taken = []
 
         def nolink(a, b, **kw):
-            with open(b, "wb") as f:  # 名前を付ける直前に、ほかの誰かが同じ名前を作る
-                f.write(b"other")
-            taken.append(b)
             raise OSError(_errno.EPERM, "Operation not permitted")
         ldhdd.os.link = nolink
         try:
-            with self.assertRaisesRegex(ldhdd.LdhddError, "バックアップを作れません"):
+            with self.assertRaisesRegex(ldhdd.LdhddError, "--no-backup"):
                 self.quiet_update(v)
         finally:
             ldhdd.os.link = orig_link
         self.assertEqual(sha(v), before)
-        self.assertEqual(read(taken[0]), b"other")
-        self.assertEqual(sorted(os.listdir(self.dir)), sorted(["t.vhd", os.path.basename(taken[0])]))
+        self.assertEqual(os.listdir(self.dir), ["t.vhd"])
+        # --no-backup なら書ける
+        self.quiet_update(v, backup=False)
+
+    @unittest.skipIf(os.name == "nt", "ハードリンクのテスト")
+    def test_backup_interrupted_leaves_nothing(self):
+        # Ctrl-C で止まっても、正式な名前の物も仮ファイルも残らない
+        v = self.vhd()
+        before = sha(v)
+        orig_link = ldhdd.os.link
+
+        def interrupt(a, b, **kw):
+            raise KeyboardInterrupt
+        ldhdd.os.link = interrupt
+        try:
+            with self.assertRaises(KeyboardInterrupt):
+                self.quiet_update(v)
+        finally:
+            ldhdd.os.link = orig_link
+        self.assertEqual(sha(v), before)
+        self.assertEqual(os.listdir(self.dir), ["t.vhd"])
+
+    @unittest.skipIf(os.name == "nt", "ハードリンクのテスト")
+    def test_backup_content_matches_original(self):
+        v = self.vhd()
+        base = read(v)
+        bak = self.quiet_update(v)
+        self.assertEqual(read(bak), base)
 
     @unittest.skipIf(os.name == "nt", "ハードリンクのテスト")
     def test_backup_name_taken_during_publish(self):
