@@ -137,14 +137,25 @@ def read_d88(data: bytes) -> Dict[Tuple[int, int, int], bytes]:
     disk_size = _u32(data, 0x1C)
     if disk_size < 0x2B0 or disk_size > len(data):
         raise LdhddError("D88 のヘッダ (ディスクサイズ) が壊れています")
-    offsets = [_u32(data, 0x20 + 4 * i) for i in range(164)]
-    nonzero = [o for o in offsets if o]
-    if not nonzero:
+    # トラック表は 164 個 (0x2B0 まで) または 160 個 (0x2A0 まで) などがある。
+    # 先頭から順に読み、いちばん小さいトラックの位置を表の終わりとして、それより前の項目だけを使う。
+    offsets: List[int] = []
+    table_end = 0x2B0
+    for i in range(164):
+        pos = 0x20 + 4 * i
+        if pos + 4 > table_end:
+            break
+        off = _u32(data, pos)
+        if off:
+            if off < 0x20 + 4 * (i + 1) or off >= disk_size:
+                raise LdhddError("D88 のトラック表が壊れています (項目 %d)" % i)
+            table_end = min(table_end, off)
+        offsets.append(off)
+    if not any(offsets):
         raise LdhddError("D88 にトラックがありません")
-    table_end = min(nonzero)
     secs: Dict[Tuple[int, int, int], bytes] = {}
     for i, off in enumerate(offsets):
-        if not off or 0x20 + 4 * i >= table_end:
+        if not off:
             continue
         p = off
         count = None
@@ -454,6 +465,9 @@ def check_fat_bpb(sec: bytes, part_sectors: int, read_part=None) -> None:
     spf = _u16(sec, 22)
     if bps not in SUPPORTED_BPS:
         raise LdhddError("第 1 パーティションの BPB: セクタサイズ %d に HDD.COM が対応していません (512/1024/2048 のみ)" % bps)
+    if bps == 2048 and sec[0] != 0xEB:
+        # hdd.asm の 2048 バイト向けの変換 (bpb2k) は先頭が EB の時だけ行われる
+        raise LdhddError("第 1 パーティションの BPB: 2048 バイトのセクタは先頭が EB の物だけ使えます")
     if not (_is_pow2(spc) and spc <= 128):
         raise LdhddError("第 1 パーティションの BPB: クラスタのセクタ数 %d がおかしい" % spc)
     if spf == 0:
@@ -479,6 +493,9 @@ def check_fat_bpb(sec: bytes, part_sectors: int, read_part=None) -> None:
     if (res + nf * spf) * k > 0xFFFF or tot >= (1 << 24):
         raise LdhddError("第 1 パーティションの BPB: FAT か総セクタ数が大きすぎます")
     data_start = res + nf * spf + dir_secs
+    # DPB_14_ADDCL16 = データ領域の位置 - 2 クラスタ (16 ビット。2048 バイトのセクタでは倍にされる)
+    if not 0 <= (data_start - 2 * spc) * k <= 0xFFFF:
+        raise LdhddError("第 1 パーティションの BPB: データ領域の位置 (%d セクタ) が HDD.COM の DPB に入りません" % data_start)
     clusters = (tot - data_start) // spc if tot > data_start else 0
     if not 1 <= clusters < 65525:
         raise LdhddError("第 1 パーティションの BPB: データ領域がおかしい (クラスタ数 %d)" % clusters)
@@ -702,13 +719,26 @@ def _backup_path(path: str) -> str:
 
 
 def make_backup(f, path: str) -> str:
-    """開いているファイル f の中身を、path の隣に新しい名前でコピーする"""
+    """開いているファイル f の中身を、path の隣に新しい名前でコピーする。
+    仮の名前に書いて同期してから正式な名前にするので、途中で失敗しても正式な名前の物は残らない。"""
     dst = _backup_path(path)
+    tmp = dst + ".part"
     f.seek(0)
-    with open(dst, "xb") as out:
-        shutil.copyfileobj(f, out, 1024 * 1024)
-        out.flush()
-        os.fsync(out.fileno())
+    try:
+        with open(tmp, "xb") as out:
+            shutil.copyfileobj(f, out, 1024 * 1024)
+            out.flush()
+            os.fsync(out.fileno())
+        if os.path.exists(dst):
+            raise OSError("バックアップの名前 %s が既にあります" % dst)
+        os.rename(tmp, dst)
+    except OSError as e:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+        raise LdhddError("バックアップを作れませんでした (%s)。何も書き込んでいません" % e)
     return dst
 
 

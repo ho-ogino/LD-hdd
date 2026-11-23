@@ -296,6 +296,23 @@ class TestD88(unittest.TestCase):
                          {"HDD.COM": 1254, "MKLDHD.BAT": 128, "LD.BIN": 11117, "HDD1.COM": 1270, "MKLDHD1.BAT": 128})
         self.assertEqual(files["HDD.COM"], read(HDD_COM))
 
+    def test_160_track_table(self):
+        # トラック表が 160 個 (0x2A0 まで) の D88 でも同じファイルが読める
+        data = read(MKLDHD)
+        size = struct.unpack_from("<I", data, 0x1C)[0]
+        offs = [struct.unpack_from("<I", data, 0x20 + 4 * i)[0] for i in range(164)]
+        self.assertEqual(min(o for o in offs if o), 0x2B0)
+        hdr = bytearray(data[:0x2A0])
+        struct.pack_into("<I", hdr, 0x1C, size - 16)
+        for i in range(160):
+            struct.pack_into("<I", hdr, 0x20 + 4 * i, offs[i] - 16 if offs[i] else 0)
+        packed = bytes(hdr) + data[0x2B0:]
+        with tempfile.TemporaryDirectory() as td:
+            p = os.path.join(td, "t160.d88")
+            with open(p, "wb") as f:
+                f.write(packed)
+            self.assertEqual(ldhdd.files_from_d88(p), ldhdd.files_from_d88(MKLDHD))
+
     def test_ipl_style_without_bpb(self):
         ld = fake_ld_bin()
         img = make_fat12_2d([("LD", "BIN", ld), ("HDD", "COM", b"\xc9" * 1254)], with_bpb=False)
@@ -593,6 +610,41 @@ class TestUpdate(unittest.TestCase):
         self.assert_refused(v)
         self.quiet_update(v, backup=False, force=True)
 
+    def write_part_bpb(self, v, bpb):
+        with open(v, "r+b") as f:
+            f.seek(128 * 512)
+            f.write(bpb)
+            for off, head in fat_init(bpb):
+                f.seek(128 * 512 + off)
+                f.write(head)
+
+    def test_2048_sector_needs_eb(self):
+        bpb = bpb_sector(96, bps=2048, spc=1, root=64)
+        v = self.vhd("eb.vhd")
+        self.write_part_bpb(v, bpb)
+        self.quiet_update(v, backup=False)
+        v2 = self.vhd("e9.vhd")
+        self.write_part_bpb(v2, b"\xe9" + bpb[1:])
+        with self.assertRaisesRegex(ldhdd.LdhddError, "EB"):
+            self.quiet_update(v2, backup=False)
+
+    def test_backup_failure_leaves_nothing(self):
+        v = self.vhd()
+        before = sha(v)
+        orig = ldhdd.shutil.copyfileobj
+
+        def fail(src, dst, n=0):
+            dst.write(b"partial")
+            raise OSError(28, "No space left on device")
+        ldhdd.shutil.copyfileobj = fail
+        try:
+            with self.assertRaisesRegex(ldhdd.LdhddError, "バックアップを作れません"):
+                self.quiet_update(v)
+        finally:
+            ldhdd.shutil.copyfileobj = orig
+        self.assertEqual(sha(v), before)
+        self.assertEqual(os.listdir(self.dir), ["t.vhd"])
+
     @unittest.skipIf(os.name == "nt", "flock のテスト")
     def test_locked_by_other_process(self):
         import subprocess
@@ -720,6 +772,16 @@ class TestDpbLimits(unittest.TestCase):
         self.check(bpb_sector(1000, bps=2048, spc=1, root=512, res=127), 4000)
         with self.assertRaisesRegex(ldhdd.LdhddError, "予約セクタ"):
             self.check(bpb_sector(1000, bps=2048, spc=1, root=512, res=128), 4000)
+
+    def test_2048_data_offset(self):
+        # 2048 バイトのセクタでは、データ領域の位置 - 2 クラスタを倍にした値が 16 ビットに収まること
+        def bpb(spf):
+            data_start = 1 + 2 * spf + 512 * 32 // 2048
+            return bpb_sector(data_start + 100, bps=2048, spc=1, root=512, spf=spf)
+        big = 40000 * 4
+        self.check(bpb(16380), big)
+        with self.assertRaisesRegex(ldhdd.LdhddError, "データ領域の位置"):
+            self.check(bpb(16381), big)
 
     def test_root_dir_sectors(self):
         with self.assertRaisesRegex(ldhdd.LdhddError, "ルートディレクトリ"):
