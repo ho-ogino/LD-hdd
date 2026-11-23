@@ -320,17 +320,23 @@ def ld_version(data: bytes) -> str:
     return m.group(0).decode("ascii", "replace").strip() if m else "不明"
 
 
-def build_stub(unit: int) -> Tuple[bytearray, int, int]:
+def build_stub(unit: int, legacy: bool = False) -> Tuple[bytearray, int, int]:
     """(スタブ, TSS のファイル位置, DRIVE のファイル位置) を返す。
-    unit 0 は MAKESYS と同じ。unit 1〜3 は JP $0100 の前に LD A,'n' / LD ($005D),A を足し、
-    HDD.COM の第 1 引数 (FCB1 の名前部) に番号を渡す (HDD.COM は書き換えない)。"""
+    unit 0 は MAKESYS と同じ。unit 1〜3 は JP $0100 の前に LD HL,2000H+'n' / LD ($005D),HL を足し、
+    HDD.COM の第 1 引数 (FCB1 の名前部) を「数字 + 空白」にする (HDD.COM は書き換えない)。
+    MAKESYS のスタブの空白で埋めるループは INC HL が無く 005DH しか埋めないので、
+    005EH の空白もここで書く (HDD.COM の getnum は空白まで読む)。
+    legacy=True は、005EH を書かなかった以前の版 (LD A,'n' / LD ($005D),A) の形 (見分ける時だけ使う)。"""
     if unit not in (0, 1, 2, 3):
         raise LdhddError("unit は 0〜3 です (%r)" % (unit,))
     stub = bytearray(STUB_TEMPLATE)
     tss = _TSS_POS
     drive = _DRIVE_POS
     if unit:
-        ins = bytes([0x3E, 0x30 + unit, 0x32, 0x5D, 0x00])
+        if legacy:
+            ins = bytes([0x3E, 0x30 + unit, 0x32, 0x5D, 0x00])
+        else:
+            ins = bytes([0x21, 0x30 + unit, 0x20, 0x22, 0x5D, 0x00])
         stub[_JP_0100_POS:_JP_0100_POS] = ins
         tss += len(ins)
         drive += len(ins)
@@ -355,14 +361,14 @@ def makesys(ld_bin: bytes, com: bytes, unit: int = 0) -> bytes:
     return assemble_sys(ld_bin, com, unit)
 
 
-def assemble_sys(ld_bin: bytes, com: bytes, unit: int = 0, drive: int = STUB_DRIVE) -> bytes:
+def assemble_sys(ld_bin: bytes, com: bytes, unit: int = 0, drive: int = STUB_DRIVE, legacy: bool = False) -> bytes:
     """合体版 LD.BIN を組み立てる (新しく作る時は makesys を使う)。
     既にある起動部を見分ける時の作り直しにも使うので、LD.BIN の中身の検査はここではしない。
     drive はスタブの DRIVE 値 (既定 0x20 = 今の MAKESYS と同じ)"""
     ld = parse_msx_bin(ld_bin)
     if len(com) < 1:
         raise LdhddError("COM が空です")
-    stub, tss_pos, drive_pos = build_stub(unit)
+    stub, tss_pos, drive_pos = build_stub(unit, legacy)
     s = len(stub)
     c = len(com)
     com_start = ld.top - 7 - c
@@ -404,13 +410,14 @@ class SysInfo(NamedTuple):
     unit_override: Optional[int]  # スタブで指定した unit (無ければ None)
     com: bytes
     ld_bin: bytes
+    legacy_unit: bool = False  # 以前の版の --unit (005EH を書かない、効かない形)
 
 
 def parse_sys(sys_bin: bytes) -> SysInfo:
     """合体版 LD.BIN を分解する (info 用)"""
     hdr = parse_msx_bin(sys_bin, "起動部の LD.BIN")
-    for unit in (0, 1, 2, 3):
-        stub, tss_pos, drive_pos = build_stub(unit)
+    for unit, legacy in ((0, False), (1, False), (2, False), (3, False), (1, True), (2, True), (3, True)):
+        stub, tss_pos, drive_pos = build_stub(unit, legacy)
         s = len(stub)
         if len(sys_bin) < s + 8:
             continue
@@ -421,13 +428,13 @@ def parse_sys(sys_bin: bytes) -> SysInfo:
             com = sys_bin[s:s + c]
             ld_bin = sys_bin[s + c:]
             try:
-                rebuilt = assemble_sys(ld_bin, com, unit, drive=cand[drive_pos])
+                rebuilt = assemble_sys(ld_bin, com, unit, drive=cand[drive_pos], legacy=legacy)
             except LdhddError:
                 continue
             # 外側のヘッダ・スタブの番地・中の LD.BIN のヘッダがすべて噛み合っていること
             if rebuilt != sys_bin:
                 continue
-            return SysInfo(7 + hdr.end - hdr.top, unit if unit else None, com, ld_bin)
+            return SysInfo(7 + hdr.end - hdr.top, unit if unit else None, com, ld_bin, legacy)
     raise LdhddError("起動部の LD.BIN が MAKESYS の形ではありません")
 
 
@@ -638,7 +645,8 @@ class TargetCheck(NamedTuple):
     new_end: int  # 新しい起動部の終わり
     write_end: int  # 書く範囲の終わり (前の起動部の方が長ければ、その残りを 0 で消す所まで)
     existing: ExistingBoot
-    nonzero_gap: Optional[int]  # 隙間で 0 でなかった最初の位置
+    nonzero_gap: Optional[int]  # 隙間で 0 でなかった最初の位置 (起動ファイルの範囲と分かる時は None)
+    residue: int = 0  # 起動ファイルの範囲の中で上書きする、0 でないバイト数 (前の起動部として確かめた所を除く)
 
 
 def check_target(f, write_len: int) -> TargetCheck:
@@ -682,11 +690,23 @@ def check_target(f, write_len: int) -> TargetCheck:
     check_fat_bpb(_read_at(f, base, SECTOR), p1.count, lambda off, n: _read_at(f, base + off, n))
     keep_from = old_end if ex.old_len else SYS_OFFSET
     nonzero = None
-    for i in range(keep_from, new_end):
-        if head[i] != 0:
-            nonzero = i
-            break
-    return TargetCheck(vk, parts, new_end, write_end, ex, nonzero)
+    residue = 0
+    # 起動セクタの IPL 用 FCB が LSX-DodgersHD の物 (名前・size=F000・entry=0021 などが一致) なら、
+    # IPL が読む先頭 0xF000 バイトは起動ファイルの範囲そのもの。パーティションと重ならないことは上で確かめた
+    boot_file = head[:0x20] == BOOT_LOADER[:0x20]
+    if boot_file:
+        for i in range(keep_from, new_end):
+            if head[i] != 0:
+                residue += 1
+    else:
+        # まだ LSX-DodgersHD の IPL が無い: これから IPL を書くと先頭 0xF000 (パーティションの手前まで) を
+        # 起動ファイルの範囲と名乗ることになるので、書く範囲だけでなくその範囲全体に 0 でないデータが無いこと
+        area_end = min([IPL_LOAD_SIZE, len(head)] + [p.lba * SECTOR for p in used])
+        for i in range(keep_from, max(new_end, area_end)):
+            if head[i] != 0:
+                nonzero = i
+                break
+    return TargetCheck(vk, parts, new_end, write_end, ex, nonzero, residue)
 
 
 # ---------------------------------------------------------------------------
@@ -961,8 +981,15 @@ def _update_locked(f, target, inputs, sys_bin, unit, backup, force, dry_run, out
               " 。新しい方が短いので残りを 0 で消します" if chk.write_end > chk.new_end else ""), file=out)
     else:
         print("前の起動部: IPL はあるが中身を確かめられません (前の起動部として扱いません)", file=out)
+    if chk.residue:
+        if chk.existing.old_len:
+            print("残り      : 前の起動部の後ろの残り %d バイトも上書きします (IPL が読む起動ファイルの範囲の中)"
+                  % chk.residue, file=out)
+        else:
+            print("残り      : 起動部を書く範囲にある 0 でない %d バイトを上書きします (前の起動部を確かめられないため、"
+                  "その分も含みます。IPL が読む起動ファイルの範囲の中)" % chk.residue, file=out)
     if chk.nonzero_gap is not None:
-        msg = "起動部を書く範囲の %d バイト目に 0 でないデータがあります" % chk.nonzero_gap
+        msg = "起動ファイルの範囲 (先頭 60KB、パーティションの手前まで) の %d バイト目に 0 でないデータがあります" % chk.nonzero_gap
         if not force:
             raise LdhddError(msg + "。上書きしてよい場合だけ --force を付けてください")
         print("注意      : " + msg + " (--force で上書きします)", file=out)
@@ -1044,7 +1071,10 @@ def info(target: str, out=None) -> None:
     print("起動部    : あり (LD.BIN %d バイト)" % ex.old_len, file=out)
     print("LSX-Dodgers: %s" % ld_version(si.ld_bin), file=out)
     print("COM       : %s" % describe_com(si.com), file=out)
-    if si.unit_override is not None:
+    if si.legacy_unit:
+        print("unit      : スタブで %d を指定 (以前の版の誤りで、この指定は効きません。update し直してください)"
+              % si.unit_override, file=out)
+    elif si.unit_override is not None:
         print("unit      : スタブで %d を指定" % si.unit_override, file=out)
     else:
         print("unit      : スタブでの指定なし (unit は COM 次第)", file=out)
