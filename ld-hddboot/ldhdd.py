@@ -772,10 +772,27 @@ def make_backup(f, path: str) -> str:
             except OSError:
                 pass
         raise LdhddError("バックアップを作れませんでした (%s)。何も書き込んでいません" % e)
+    # 名前 (ディレクトリの項目) も確かにディスクへ書いてから、イメージに書き始める
+    try:
+        _fsync_dir(os.path.dirname(os.path.abspath(dst)))
+    except OSError as e:
+        raise LdhddError("バックアップ %s の名前をディスクに書き切れませんでした (%s)。イメージには何も書き込んでいません"
+                         " (バックアップはできているかもしれません)" % (dst, e))
     if leftover:
         # 正式な名前のバックアップはできている。仮の名前が消せなかっただけ
         print("注意: 仮ファイル %s を消せませんでした (バックアップ %s はできています)" % (leftover, dst), file=sys.stderr)
     return dst
+
+
+def _fsync_dir(path: str) -> None:
+    """ディレクトリの項目をディスクに書く (POSIX のみ。Windows ではディレクトリを同期できないので何もしない)"""
+    if os.name == "nt":
+        return
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 def _publish_no_replace(tmp: str, dst: str) -> Optional[str]:

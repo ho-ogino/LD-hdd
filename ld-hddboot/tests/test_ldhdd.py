@@ -790,6 +790,37 @@ class TestUpdate(unittest.TestCase):
         self.assertTrue(os.path.exists(bak))
         self.assertIn("消せませんでした", err.getvalue())
 
+    def test_backup_dir_sync_failure_keeps_image(self):
+        v = self.vhd()
+        before = sha(v)
+        orig = ldhdd._fsync_dir
+
+        def fail(path):
+            raise OSError(5, "I/O error")
+        ldhdd._fsync_dir = fail
+        try:
+            with self.assertRaisesRegex(ldhdd.LdhddError, "何も書き込んでいません") as cm:
+                self.quiet_update(v)
+        finally:
+            ldhdd._fsync_dir = orig
+        self.assertEqual(sha(v), before)
+        baks = [x for x in os.listdir(self.dir) if x.endswith(".bak")]
+        self.assertEqual(len(baks), 1)
+        self.assertIn(baks[0], str(cm.exception))
+
+    @unittest.skipIf(os.name == "nt", "ディレクトリの同期のテスト")
+    def test_backup_dir_synced_before_write(self):
+        v = self.vhd()
+        order = []
+        orig_dir, orig_write = ldhdd._fsync_dir, ldhdd._write_all
+        ldhdd._fsync_dir = lambda p: (order.append("dir"), orig_dir(p))[1]
+        ldhdd._write_all = lambda f, d: (order.append("write"), orig_write(f, d))[1]
+        try:
+            self.quiet_update(v)
+        finally:
+            ldhdd._fsync_dir, ldhdd._write_all = orig_dir, orig_write
+        self.assertEqual(order, ["dir", "write"])
+
     @unittest.skipIf(os.name == "nt", "flock のテスト")
     def test_locked_by_other_process(self):
         import subprocess
