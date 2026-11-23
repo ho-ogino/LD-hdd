@@ -638,7 +638,7 @@ class TargetCheck(NamedTuple):
     write_end: int  # 書く範囲の終わり (前の起動部の方が長ければ、その残りを 0 で消す所まで)
     existing: ExistingBoot
     nonzero_gap: Optional[int]  # 隙間で 0 でなかった最初の位置 (起動ファイルの範囲と分かる時は None)
-    residue: int = 0  # 起動ファイルの範囲の中で上書きする、前の起動部の後ろの残り (0 でないバイト数)
+    residue: int = 0  # 起動ファイルの範囲の中で上書きする、0 でないバイト数 (前の起動部として確かめた所を除く)
 
 
 def check_target(f, write_len: int) -> TargetCheck:
@@ -686,11 +686,16 @@ def check_target(f, write_len: int) -> TargetCheck:
     # 起動セクタの IPL 用 FCB が LSX-DodgersHD の物 (名前・size=F000・entry=0021 などが一致) なら、
     # IPL が読む先頭 0xF000 バイトは起動ファイルの範囲そのもの。パーティションと重ならないことは上で確かめた
     boot_file = head[:0x20] == BOOT_LOADER[:0x20]
-    for i in range(keep_from, new_end):
-        if head[i] != 0:
-            if boot_file:
+    if boot_file:
+        for i in range(keep_from, new_end):
+            if head[i] != 0:
                 residue += 1
-            elif nonzero is None:
+    else:
+        # まだ LSX-DodgersHD の IPL が無い: これから IPL を書くと先頭 0xF000 (パーティションの手前まで) を
+        # 起動ファイルの範囲と名乗ることになるので、書く範囲だけでなくその範囲全体に 0 でないデータが無いこと
+        area_end = min([IPL_LOAD_SIZE, len(head)] + [p.lba * SECTOR for p in used])
+        for i in range(keep_from, max(new_end, area_end)):
+            if head[i] != 0:
                 nonzero = i
                 break
     return TargetCheck(vk, parts, new_end, write_end, ex, nonzero, residue)
@@ -969,10 +974,14 @@ def _update_locked(f, target, inputs, sys_bin, unit, backup, force, dry_run, out
     else:
         print("前の起動部: IPL はあるが中身を確かめられません (前の起動部として扱いません)", file=out)
     if chk.residue:
-        print("残り      : 前の起動部の後ろの残り %d バイトも上書きします (IPL が読む起動ファイルの範囲の中)"
-              % chk.residue, file=out)
+        if chk.existing.old_len:
+            print("残り      : 前の起動部の後ろの残り %d バイトも上書きします (IPL が読む起動ファイルの範囲の中)"
+                  % chk.residue, file=out)
+        else:
+            print("残り      : 起動部を書く範囲にある 0 でない %d バイトを上書きします (前の起動部を確かめられないため、"
+                  "その分も含みます。IPL が読む起動ファイルの範囲の中)" % chk.residue, file=out)
     if chk.nonzero_gap is not None:
-        msg = "起動部を書く範囲の %d バイト目に 0 でないデータがあります" % chk.nonzero_gap
+        msg = "起動ファイルの範囲 (先頭 60KB、パーティションの手前まで) の %d バイト目に 0 でないデータがあります" % chk.nonzero_gap
         if not force:
             raise LdhddError(msg + "。上書きしてよい場合だけ --force を付けてください")
         print("注意      : " + msg + " (--force で上書きします)", file=out)

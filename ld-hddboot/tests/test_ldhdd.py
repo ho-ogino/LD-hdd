@@ -502,6 +502,24 @@ class TestUpdate(unittest.TestCase):
         self.assertIn("残り 1 バイト", out.getvalue())
         self.assertEqual(read(v)[0x200:0x200 + len(ldhdd.makesys(self.ld161, self.com))], ldhdd.makesys(self.ld161, self.com))
 
+    def test_first_install_checks_whole_boot_area(self):
+        # IPL がまだ無い VHD: 書く範囲の後ろ (先頭 60KB の中) にある別のデータも、最初の書き込みで --force を求める
+        v = self.vhd()
+        with open(v, "r+b") as f:
+            f.seek(0x5000)
+            f.write(b"\x42")
+        small_ld = fake_ld_bin(top=0xE000, body_len=0x1000)
+        self.assert_refused(v, inputs_from(small_ld, self.com))
+        self.quiet_update(v, inputs_from(small_ld, self.com), backup=False, force=True)
+        # --force で範囲を名乗った後は、長い版も --force 無しで書ける
+        self.quiet_update(v, backup=False)
+        # パーティションより後ろのデータは範囲の外なので見ない
+        v2 = self.vhd("t2.vhd")
+        with open(v2, "r+b") as f:
+            f.seek(128 * 512 + 0x4000)
+            f.write(b"\x42")
+        self.quiet_update(v2, inputs_from(small_ld, self.com), backup=False)
+
     def test_gap_residue_needs_exact_ipl_fcb(self):
         # IPL 用 FCB が 1 バイトでも違えば (例: size が F000 でない)、今までどおり --force が要る
         small_ld = fake_ld_bin(top=0xE000, body_len=0x1000)
@@ -653,7 +671,7 @@ class TestUpdate(unittest.TestCase):
             f.write(ldhdd.boot_record(mbr) + bytes(comb))
         out = io.StringIO()
         ldhdd.update(v, self.inputs, backup=False, out=out)
-        self.assertIn("残り", out.getvalue())
+        self.assertIn("起動部を書く範囲にある 0 でない", out.getvalue())
 
     def write_part_bpb(self, v, bpb):
         with open(v, "r+b") as f:
