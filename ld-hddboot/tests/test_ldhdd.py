@@ -1385,6 +1385,84 @@ class TestNew(unittest.TestCase):
                 self.assertEqual(read(path), b"keep")
                 os.remove(path)
 
+    class FakeKernel32:
+        """MoveFileExW の偽物。MOVEFILE_REPLACE_EXISTING (0x1) が立っていれば置き換える。fail で失敗させる"""
+        def __init__(self, fail=False):
+            self.calls = []
+            self.fail = fail
+
+        def MoveFileExW(self, src, dst, flags):
+            self.calls.append(flags)
+            if self.fail or (os.path.exists(dst) and not flags & 0x1):
+                return 0
+            os.replace(src, dst)
+            return 1
+
+    def windows_mode(self, k):
+        orig = (ldhdd._IS_WINDOWS, ldhdd._windows_move)
+        ldhdd._IS_WINDOWS = True
+        ldhdd._windows_move = lambda s_, d_, fl, kernel32=None: orig[1](s_, d_, fl, kernel32=k)
+        return orig
+
+    def test_windows_force_replace_write_through(self):
+        path = os.path.join(self.dir, "n.vhd")
+        with open(path, "wb") as f:
+            f.write(b"keep")
+        k = self.FakeKernel32()
+        orig = self.windows_mode(k)
+        try:
+            self.new(force=True)
+        finally:
+            ldhdd._IS_WINDOWS, ldhdd._windows_move = orig
+        self.assertEqual(k.calls, [0x1 | 0x8])  # REPLACE_EXISTING | WRITE_THROUGH
+        self.assertEqual(os.path.getsize(path), (16 << 20) + 512)
+        self.assertEqual(os.listdir(self.dir), ["n.vhd"])
+        # 置き換えに失敗したら、元のファイルはそのまま・仮ファイルは残らない
+        with open(path, "wb") as f:
+            f.write(b"keep")
+        k2 = self.FakeKernel32(fail=True)
+        orig = self.windows_mode(k2)
+        try:
+            with self.assertRaisesRegex(ldhdd.LdhddError, "元のファイルはそのまま"):
+                self.new(force=True)
+        finally:
+            ldhdd._IS_WINDOWS, ldhdd._windows_move = orig
+        self.assertEqual(read(path), b"keep")
+        self.assertEqual(os.listdir(self.dir), ["n.vhd"])
+
+    def test_cleanup_failure_is_reported(self):
+        orig_w, orig_rm = ldhdd._write_all, ldhdd.os.remove
+        calls = []
+
+        def fail(f, d):
+            calls.append(1)
+            if len(calls) == 2:
+                raise OSError(5, "injected")
+            return orig_w(f, d)
+
+        def norm(p):
+            raise OSError(30, "Read-only file system")
+        ldhdd._write_all, ldhdd.os.remove = fail, norm
+        try:
+            with self.assertRaisesRegex(ldhdd.LdhddError, "消せませんでした") as cm:
+                self.new()
+        finally:
+            ldhdd._write_all, ldhdd.os.remove = orig_w, orig_rm
+        self.assertIn("injected", str(cm.exception))
+        self.assertNotIn("何も残していません", str(cm.exception))
+
+    def test_info_bpb_larger_than_partition(self):
+        path, lay = self.new("b.vhd", "2M")
+        with open(path, "r+b") as f:
+            f.seek(128 * 512 + 19)
+            f.write(b"\0\0")
+            f.seek(128 * 512 + 32)
+            f.write(struct.pack("<I", 261632))  # 127.75MB を名乗る
+        run_main(["info", path])
+        self.assertIn("パーティション", run_main.out)
+        self.assertIn("を越えています", run_main.out)
+        self.assertNotIn("127.", run_main.out)
+
     def test_info_label_needs_signature_and_is_sanitized(self):
         path, lay = self.new("l.vhd", "2M", label="ABC")
         with open(path, "r+b") as f:

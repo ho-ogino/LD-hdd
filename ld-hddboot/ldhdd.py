@@ -859,15 +859,30 @@ def _publish_no_replace(tmp: str, dst: str) -> Optional[str]:
 MOVEFILE_WRITE_THROUGH = 0x8
 
 
-def _windows_move_no_replace(src: str, dst: str, kernel32=None) -> None:
-    """MoveFileExW を MOVEFILE_REPLACE_EXISTING 無しで呼ぶ (既にある名前には失敗する)。
-    MOVEFILE_WRITE_THROUGH で、名前の変更がディスクに書き切られてから戻る。"""
+MOVEFILE_REPLACE_EXISTING = 0x1
+
+
+def _windows_move(src: str, dst: str, flags: int, kernel32=None) -> None:
+    """MoveFileExW を呼ぶ。MOVEFILE_WRITE_THROUGH で、名前の変更がディスクに書き切られてから戻る"""
     import ctypes
     if kernel32 is None:
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    if not kernel32.MoveFileExW(src, dst, MOVEFILE_WRITE_THROUGH):
+    if not kernel32.MoveFileExW(src, dst, flags):
         err = ctypes.get_last_error() if hasattr(ctypes, "get_last_error") else 0
         raise OSError(err, "MoveFileExW が失敗しました (%d)" % err)
+
+
+def _windows_move_no_replace(src: str, dst: str, kernel32=None) -> None:
+    """MOVEFILE_REPLACE_EXISTING 無し (既にある名前には失敗する) + 書き切り"""
+    _windows_move(src, dst, MOVEFILE_WRITE_THROUGH, kernel32)
+
+
+def _replace_durable(src: str, dst: str) -> None:
+    """src で dst を置き換える。Windows は MoveFileExW の書き切り、POSIX は os.replace (後でディレクトリを fsync)"""
+    if _IS_WINDOWS:
+        _windows_move(src, dst, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)
+    else:
+        os.replace(src, dst)
 
 
 def _lock_windows(f, msvcrt_mod):
@@ -986,6 +1001,10 @@ def describe_fat(pb: bytes, p1: "Partition", vk: VhdKind) -> str:
         return "FAT32 など (HDD.COM では使えません)"
     if not bps or not spc:
         return "BPB が壊れています"
+    if (p1.lba + p1.count) * SECTOR > vk.data_size:
+        return "パーティションがファイルの外にはみ出しています"
+    if tot * bps > p1.count * SECTOR:
+        return "BPB の大きさ (%d バイト) がパーティション (%d バイト) を越えています" % (tot * bps, p1.count * SECTOR)
     ds = res + nf * spf + (root * 32 + bps - 1) // bps
     cl = (tot - ds) // spc if tot > ds else 0
     # ラベル欄は拡張ブート署名 (29h) がある時だけ。表示できない文字は ? にする
@@ -1276,7 +1295,7 @@ def new_image(path: str, size: int, inputs: Inputs, input_paths: List[str], unit
             _update_locked(f, path, inputs, sys_bin, unit, False, False, False, io.StringIO())
             os.fsync(f.fileno())
         if force:
-            os.replace(created, path)  # ここが確定
+            _replace_durable(created, path)  # ここが確定
         committed = True
     except BaseException as e:
         if f is None:
@@ -1284,15 +1303,24 @@ def new_image(path: str, size: int, inputs: Inputs, input_paths: List[str], unit
                 os.close(fd)
             except OSError:
                 pass
+        left = None
         if not committed:
             # 自分が作ったファイルがその名前のままの時だけ消す (同一性を読めなかった時は、作った直後なので消す)
             try:
                 if mine is None or os.path.samestat(os.stat(created), mine):
                     os.remove(created)
-            except OSError:
+            except FileNotFoundError:
                 pass
+            except OSError as ce:
+                left = "作りかけのファイル %s を消せませんでした (%s)。手で消してください" % (created, ce)
         if isinstance(e, OSError):
-            raise LdhddError("作れませんでした (%s)。%s" % (e, "元のファイルはそのままです" if force else "何も残していません"))
+            if left:
+                rest = left + ("。元のファイルはそのままです" if force else "")
+            else:
+                rest = "元のファイルはそのままです" if force else "何も残していません"
+            raise LdhddError("作れませんでした (%s)。%s" % (e, rest))
+        if left:
+            print("注意: " + left, file=sys.stderr)
         raise
     try:
         _fsync_dir(d)
