@@ -473,9 +473,10 @@ def looks_like_bpb(sec: bytes) -> bool:
     return _is_pow2(sec[12]) and _is_pow2(sec[13])
 
 
-def check_fat_bpb(sec: bytes, part_sectors: int, read_part=None) -> None:
+def check_fat_bpb(sec: bytes, part_sectors: int, read_part=None, fat1_only: bool = False) -> None:
     """第 1 パーティションの BPB が LSX-Dodgers で使える FAT12/16 かを確かめる。
-    read_part(off, n) はパーティション先頭からの読み出し (FAT の先頭を確かめるのに使う)"""
+    read_part(off, n) はパーティション先頭からの読み出し (FAT の先頭を確かめるのに使う)。
+    fat1_only なら FAT1 の先頭だけを確かめる (FAT2 の食い違いは FatVolume が知らせる)"""
     if not looks_like_bpb(sec):
         raise LdhddError("第 1 パーティションの先頭に BPB がありません (FAT でフォーマットされていない?)")
     bps = _u16(sec, 11)
@@ -530,7 +531,7 @@ def check_fat_bpb(sec: bytes, part_sectors: int, read_part=None) -> None:
     if not (media == 0xF0 or media >= 0xF8):
         raise LdhddError("第 1 パーティションの BPB: メディア記述子 %02X がおかしい" % media)
     if read_part is not None:
-        for k in range(nf):
+        for k in range(1 if fat1_only else nf):
             head = read_part((res + k * spf) * bps, 4)
             if fat_bits == 12:
                 ok = len(head) >= 3 and head[0] == media and head[1] == 0xFF and head[2] == 0xFF
@@ -1533,7 +1534,8 @@ class FatVolume:
         self.base = p1.lba * SECTOR
         self.part_end = (p1.lba + p1.count) * SECTOR
         bpb = _read_at(f, self.base, SECTOR)
-        check_fat_bpb(bpb, p1.count, lambda off, n: _read_at(f, self.base + off, n))
+        # FAT1 を正とするので、先頭を確かめるのも FAT1 だけ (FAT2 の先頭が違っても写しの食い違いとして知らせる)
+        check_fat_bpb(bpb, p1.count, lambda off, n: _read_at(f, self.base + off, n), fat1_only=True)
         self.bps = _u16(bpb, 11)
         self.spc = bpb[13]
         res, self.nfats, self.root_entries = _u16(bpb, 14), bpb[16], _u16(bpb, 17)

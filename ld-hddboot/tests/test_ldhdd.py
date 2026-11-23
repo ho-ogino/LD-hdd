@@ -2917,6 +2917,46 @@ class TestFatMirror(unittest.TestCase):
         self.assertEqual(run_main(["info", path]), 0)
         self.assertIn("FAT の写し: 一致", run_main.out)
 
+    def test_broken_fat2_header_is_a_mismatch(self):
+        # FAT2 の先頭 (メディア記述子) だけが壊れていても、FAT1 が正しければ読めて、add で直る
+        for phase in ("ok", "fail"):
+            path = self.vhd(name="h_%s.vhd" % phase)
+            self.add(path, [self.put("A.TXT", b"a" * 100)])
+            f, vol = self.open_vol(path)
+            fat2, fat_bytes = vol.fat_off + vol.fat_bytes, vol.fat_bytes
+            f.close()
+            with open(path, "r+b") as fh:
+                fh.seek(fat2)
+                fh.write(b"\x00")
+            before = fat_copies(path)
+            self.assertNotEqual(before[0], before[1])
+            self.assertEqual(run_main(["ls", path]), 0)
+            self.assertIn("注意: FAT の写しが食い違っています", run_main.out)
+            self.assertIn("A.TXT", run_main.out)
+            self.assertEqual(run_main(["info", path]), 0)
+            self.assertIn("FAT の写し: FAT2 が FAT1 と 1 か所 (クラスタ 0 など) 食い違い", run_main.out)
+            sha0 = sha(path)
+            out = io.StringIO()
+            ldhdd.add(path, [self.put("B.TXT", b"b")], dry_run=True, out=out)
+            self.assertEqual(sha(path), sha0)
+            src = self.put(os.path.join(phase, "B.TXT"), b"b" * 3000)
+            if phase == "fail":
+                self._inject(path, [src], fat_bytes, 2)
+                self.assertEqual(fat_copies(path), before)  # 壊れた先頭も含めて、それぞれ元に戻る
+            else:
+                self.add(path, [src])
+                c1, c2 = fat_copies(path)
+                self.assertEqual(c1, c2)
+                self.assertEqual(self.read(path, "/B.TXT"), b"b" * 3000)
+            self.assertEqual(self.read(path, "/A.TXT"), b"a" * 100)
+        # update は今までどおり、全部の FAT の先頭を確かめる
+        with ldhdd._open_target(path, False) as f:
+            vol = ldhdd.FatVolume(f)
+            bpb = ldhdd._read_at(f, vol.base, ldhdd.SECTOR)
+            rp = lambda off, n: ldhdd._read_at(f, vol.base + off, n)  # noqa: E731
+            with self.assertRaisesRegex(ldhdd.LdhddError, "FAT 2 の先頭"):
+                ldhdd.check_fat_bpb(bpb, (vol.part_end - vol.base) // ldhdd.SECTOR, rp)
+
     def test_single_fat(self):
         # FAT が 1 つの BPB: 比べる物が無く、注意も出ない
         path = self.vhd()
