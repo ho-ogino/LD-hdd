@@ -88,7 +88,28 @@ SASI_LIMIT = (1 << 21) * 256
 KNOWN_COMS = {
     "ebb2949baea45e3b6ee9b5344d41ba854529d5b2161fe4986d945528525ff5cb": "HDD.COM (LD-hdd 0.14)",
     "5124b98a63c06b2fb3296b75698427ab2d34c0c974c3427d1a797cd1f6db3c91": "HDD1.COM (旧来の HDD1 用)",
+    "52ead99ae76116b1b13046d89154c6bf99930147d2f1d66a726307acc1b4a5ff": "HDD.COM (LD-hdd 0.13)",
 }
+
+# 旧手順 (このリポジトリの過去の MKLDHD.d88 / MKLDHD1.d88) で作られた合体版 LD.BIN の sha256。
+# 印の無い前の起動部は、これと一致した時だけ長さを信じる。
+KNOWN_PAYLOADS = {
+    "e4b59618a9d85cd52f32448f4eccd168e4145c890926484e8672c6a2bf0d3cff",  # 1.61b + HDD.COM 0.14
+    "aa37ebd54f3bbab82d03977a60bcd2526db2d40e0a1c6808113160d8cda83cf8",  # 1.61b + HDD1.COM
+    "94f3bee4ea338ac1686c7c7202e2317e97b53715e7ec53944b8ae3c60128e3e6",  # 1.61b + HDD.COM 0.13
+    "a290b1a73219f335a8aab96d0a782a20ee55492ac4a9de5e9f752f3550ee647d",  # 1.61b + HDD1.COM (0.13 系)
+    "ff62984ddba781cda92cdfe1153157eb505ac90117e5a6bf88a6ad33e21eab6d",  # 1.61 + HDD.COM 0.13
+    "b193c47ad73d1b56fd8e41779410c59af261148e2b0b4c9725206f0c90a4a9a9",  # 1.61 + HDD1.COM (0.13 系)
+    "50770f7541c15f365533dc0a0b8f916fb30087694b31426992a8bdafb827175b",  # 1.55 + HDD.COM
+    "4df12ba9fcd11523c71b7c092e776f4b594e8f0e4872b6487761529bb3f96e1e",  # 1.55 + HDD1.COM
+}
+
+# ldhdd.py が書いた起動部の印 (起動セクタの 0x190〜。ここは IPL で 0x0190 に読まれるが、
+# スタブが最初に COM を 0x0100 から写すので、使われる前に上書きされる)
+META_OFFSET = 0x190
+META_MAGIC = b"LDHDDPY\x01"
+META_DIGEST_LEN = 24
+META_LEN = len(META_MAGIC) + 4 + META_DIGEST_LEN
 
 VERSION_RE = re.compile(rb"LSX-Dodgers for [^\r\n\x00]{1,60}")
 
@@ -309,8 +330,9 @@ class SysLayout(NamedTuple):
     stub_len: int
 
 
-def makesys(ld_bin: bytes, com: bytes, unit: int = 0) -> bytes:
-    """MAKESYS com out と同じ合体版 LD.BIN を作る"""
+def makesys(ld_bin: bytes, com: bytes, unit: int = 0, drive: int = STUB_DRIVE) -> bytes:
+    """MAKESYS com out と同じ合体版 LD.BIN を作る。
+    drive はスタブの DRIVE 値 (既定 0x20 = 今の MAKESYS と同じ。分解した物の作り直し用)"""
     ld = parse_msx_bin(ld_bin)
     if len(com) < 1:
         raise LdhddError("COM が空です")
@@ -347,7 +369,7 @@ def makesys(ld_bin: bytes, com: bytes, unit: int = 0) -> bytes:
     _put16(t, 28, ld.exec + 7)      # _INIT2
     _put16(t, 31, ld.exec)          # RUN_LD
     _put16(t, 37, run + tss_pos - 7)  # _TSS
-    t[drive_pos] = STUB_DRIVE
+    t[drive_pos] = drive & 0xFF
     return bytes(t) + bytes(com) + bytes(ld_bin)
 
 
@@ -373,7 +395,7 @@ def parse_sys(sys_bin: bytes) -> SysInfo:
             com = sys_bin[s:s + c]
             ld_bin = sys_bin[s + c:]
             try:
-                rebuilt = makesys(ld_bin, com, unit)
+                rebuilt = makesys(ld_bin, com, unit, drive=cand[drive_pos])
             except LdhddError:
                 continue
             # 外側のヘッダ・スタブの番地・中の LD.BIN のヘッダがすべて噛み合っていること
@@ -387,7 +409,11 @@ def parse_sys(sys_bin: bytes) -> SysInfo:
 # 起動セクタ / 対象の検査
 # ---------------------------------------------------------------------------
 
-def boot_record(mbr: bytes) -> bytes:
+def boot_meta(payload: bytes) -> bytes:
+    return META_MAGIC + struct.pack("<I", len(payload)) + hashlib.sha256(payload).digest()[:META_DIGEST_LEN]
+
+
+def boot_record(mbr: bytes, payload: Optional[bytes] = None) -> bytes:
     """IPL 用 FCB + ローダー + 0xFF 埋め + 対象の MBR の 0x1B8〜0x1FF
     (ディスク署名・予約・パーティション表・55AA)。
     旧手順 (ldhdd_boot.asm) はディスク署名も 0xFF にしていたが、ローダーは 0x43 で終わり
@@ -397,6 +423,8 @@ def boot_record(mbr: bytes) -> bytes:
     rec = bytearray([BOOT_FILL]) * SECTOR
     rec[0:len(BOOT_LOADER)] = BOOT_LOADER
     rec[MBR_KEEP_OFFSET:SECTOR] = mbr[MBR_KEEP_OFFSET:SECTOR]
+    if payload is not None:
+        rec[META_OFFSET:META_OFFSET + META_LEN] = boot_meta(payload)
     return bytes(rec)
 
 
@@ -436,7 +464,21 @@ def check_fat_bpb(sec: bytes, part_sectors: int, read_part=None) -> None:
     if tot * bps > part_sectors * SECTOR:
         raise LdhddError("第 1 パーティションの BPB の大きさ (%d バイト) がパーティション (%d バイト) を越えています"
                          % (tot * bps, part_sectors * SECTOR))
-    data_start = res + nf * spf + (root * 32 + bps - 1) // bps
+    # LSX-Dodgers の BPB2DPB と hdd.asm (2048 バイトのセクタは 1024 バイト単位に直して倍にする)
+    # が入れる DPB の欄の幅に収まること
+    k = 2 if bps == 2048 else 1
+    if (root * 32) % bps:
+        raise LdhddError("第 1 パーティションの BPB: ルートディレクトリ (%d 項目) がセクタの区切りに合いません" % root)
+    dir_secs = root * 32 // bps
+    if res * k > 255:
+        raise LdhddError("第 1 パーティションの BPB: 予約セクタ数 %d が多すぎます (HDD.COM の DPB に入りません)" % res)
+    if dir_secs * k > 255:
+        raise LdhddError("第 1 パーティションの BPB: ルートディレクトリ (%d セクタ) が大きすぎます" % dir_secs)
+    if spc * k > 128 or spc * bps > 65536:
+        raise LdhddError("第 1 パーティションの BPB: クラスタ (%d セクタ) が大きすぎます" % spc)
+    if (res + nf * spf) * k > 0xFFFF or tot >= (1 << 24):
+        raise LdhddError("第 1 パーティションの BPB: FAT か総セクタ数が大きすぎます")
+    data_start = res + nf * spf + dir_secs
     clusters = (tot - data_start) // spc if tot > data_start else 0
     if not 1 <= clusters < 65525:
         raise LdhddError("第 1 パーティションの BPB: データ領域がおかしい (クラスタ数 %d)" % clusters)
@@ -526,11 +568,17 @@ def existing_boot(head: bytes) -> ExistingBoot:
         top, end = struct.unpack_from("<HH", hdr, 1)
         old = 7 + (end - top)
         if top < end and SYS_OFFSET + old <= min(IPL_LOAD_SIZE, len(head)):
-            try:
-                parse_sys(head[SYS_OFFSET:SYS_OFFSET + old])
-            except LdhddError:
-                return ExistingBoot(True, 0)
-            return ExistingBoot(True, old)
+            payload = head[SYS_OFFSET:SYS_OFFSET + old]
+            # ヘッダの長さだけでは、後ろの無関係なバイトまで含めて名乗れてしまう。
+            # ldhdd.py が書いた印か、旧手順の既知の物と一致した時だけ長さを信じる。
+            trusted = (head[META_OFFSET:META_OFFSET + META_LEN] == boot_meta(payload)
+                       or hashlib.sha256(payload).hexdigest() in KNOWN_PAYLOADS)
+            if trusted:
+                try:
+                    parse_sys(payload)
+                except LdhddError:
+                    return ExistingBoot(True, 0)
+                return ExistingBoot(True, old)
     return ExistingBoot(True, 0)
 
 
@@ -664,26 +712,39 @@ def make_backup(f, path: str) -> str:
     return dst
 
 
-def _lock(f):
+def _lock_windows(f, msvcrt_mod):
+    """msvcrt.locking は記述子の今の位置から数えるので、Python のバッファではなく記述子そのものを 0 に置く。
+    解除に失敗しても、閉じれば外れるので、書き込み済みの更新を失敗扱いにしない。"""
+    fd = f.fileno()
+    f.flush()
+    os.lseek(fd, 0, os.SEEK_SET)
+    msvcrt_mod.locking(fd, msvcrt_mod.LK_NBLCK, IPL_LOAD_SIZE)
+
+    def unlock() -> None:
+        try:
+            f.flush()
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt_mod.locking(fd, msvcrt_mod.LK_UNLCK, IPL_LOAD_SIZE)
+        except OSError:
+            pass
+    return unlock
+
+
+def _lock(f, msvcrt_mod=None):
     """協力する書き手どうしの同時書き込みを避ける。取れなければ止める。
     POSIX は flock (ファイル全体)、Windows は先頭 0xF000 バイトの範囲ロック。
     どちらもファイルを閉じると外れる。"""
-    try:
-        import fcntl
-    except ImportError:
-        fcntl = None
+    fcntl = None
+    if msvcrt_mod is None:
+        try:
+            import fcntl
+        except ImportError:
+            import msvcrt as msvcrt_mod
     try:
         if fcntl is not None:
             fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             return lambda: fcntl.flock(f.fileno(), fcntl.LOCK_UN)
-        import msvcrt
-        f.seek(0)
-        msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, IPL_LOAD_SIZE)
-
-        def unlock() -> None:
-            f.seek(0)
-            msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, IPL_LOAD_SIZE)
-        return unlock
+        return _lock_windows(f, msvcrt_mod)
     except OSError:
         raise LdhddError("ほかのプロセスがこのファイルを使っています")
 
@@ -734,7 +795,7 @@ def _update_locked(f, target, inputs, sys_bin, unit, backup, force, dry_run, out
         print("--dry-run なので書き込みません", file=out)
         return None
     mbr = _read_at(f, 0, SECTOR)
-    area = boot_record(mbr) + sys_bin
+    area = boot_record(mbr, sys_bin) + sys_bin
     area += bytes(chk.write_end - len(area))
     bak = None
     if backup:

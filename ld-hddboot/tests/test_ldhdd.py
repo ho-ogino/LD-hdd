@@ -126,7 +126,7 @@ def make_fat12_2d(files, with_bpb=True, truncate=None):
     return bytes(img)
 
 
-def bpb_sector(total=384, spc=4, root=512, spf=None, bps=512):
+def bpb_sector(total=384, spc=4, root=512, spf=None, bps=512, res=1):
     """FAT12/16 の BPB (パーティション total セクタに合わせる)"""
     b = bytearray(512)
     b[0:3] = b"\xeb\x3c\x90"
@@ -134,14 +134,14 @@ def bpb_sector(total=384, spc=4, root=512, spf=None, bps=512):
     if spf is None:
         spf = 1
         while True:
-            data_start = 1 + 2 * spf + (root * 32 + bps - 1) // bps
+            data_start = res + 2 * spf + (root * 32 + bps - 1) // bps
             clusters = (total - data_start) // spc
             bits = 12 if clusters < 4085 else 16
             if spf * bps >= ((clusters + 2) * bits + 7) // 8:
                 break
             spf += 1
     tot16 = total if total < 0x10000 else 0
-    struct.pack_into("<HBHBHHBH", b, 11, bps, spc, 1, 2, root, tot16, 0xF8, spf)
+    struct.pack_into("<HBHBHHBH", b, 11, bps, spc, res, 2, root, tot16, 0xF8, spf)
     if not tot16:
         struct.pack_into("<I", b, 32, total)
     b[510:512] = b"\x55\xaa"
@@ -343,6 +343,18 @@ class TestBootRecord(unittest.TestCase):
         self.assertEqual(rec[0x1B8:], bytes(mbr[0x1B8:]))
         self.assertEqual(rec[0x82], 0xFF)
 
+    def test_meta(self):
+        mbr = bytearray(512)
+        mbr[0x1FE:0x200] = b"\x55\xaa"
+        payload = b"\xfe" + b"\x11" * 40
+        rec = ldhdd.boot_record(bytes(mbr), payload)
+        # 印は 0x190〜。0x80〜0xFF (コマンド行に読まれる所) を含め、それより前は asm と同じ
+        self.assertEqual(rec[:0x190], ASM_BOOT_HEAD[:0x190])
+        self.assertEqual(rec[0x190:0x198], b"LDHDDPY\x01")
+        self.assertEqual(struct.unpack_from("<I", rec, 0x198)[0], len(payload))
+        self.assertEqual(rec[0x19C:0x1B4], hashlib.sha256(payload).digest()[:24])
+        self.assertEqual(rec[0x1B4:0x1B8], b"\xff" * 4)
+
 
 class TestUpdate(unittest.TestCase):
     def setUp(self):
@@ -370,7 +382,9 @@ class TestUpdate(unittest.TestCase):
         sys_bin = ldhdd.makesys(self.ld161, self.com)
         n = 0x200 + len(sys_bin)
         # mkldhdd.py と同じ (ldhdd_boot.bin + HDDBASE[len:])。ただしディスク署名 (0x1B8〜0x1BD) は残す
-        legacy_ipl = ASM_BOOT_HEAD[:0x1B8] + base[0x1B8:0x200] + sys_bin
+        # 0x190〜0x1B3 は ldhdd.py の印 (長さと sha256)
+        meta = b"LDHDDPY\x01" + struct.pack("<I", len(sys_bin)) + hashlib.sha256(sys_bin).digest()[:24]
+        legacy_ipl = ASM_BOOT_HEAD[:0x190] + meta + ASM_BOOT_HEAD[0x1B4:0x1B8] + base[0x1B8:0x200] + sys_bin
         self.assertEqual(after, legacy_ipl + base[len(legacy_ipl):])
         self.assertEqual(after[n:], base[n:])
         self.assertEqual(read(bak), base)
@@ -528,6 +542,57 @@ class TestUpdate(unittest.TestCase):
         self.quiet_update(v, inputs_from(tiny, self.com), backup=False, force=True)
         self.assertEqual(read(v)[0x200 + old_n:0x200 + old_n + 9], b"\x5a" * 9)
 
+    def test_same_end_shift_not_trusted(self):
+        # 外側と中の終わりを同じだけ伸ばすと、ヘッダとスタブは噛み合ってしまう (R3-F1)。印で見破る
+        small = fake_ld_bin(top=0xE000, body_len=0x1000)
+        v = self.vhd()
+        self.quiet_update(v, inputs_from(small, self.com), backup=False)
+        sys_small = ldhdd.makesys(small, self.com)
+        old_n = len(sys_small)
+        with open(v, "r+b") as f:
+            f.seek(0x203)
+            f.write(struct.pack("<H", struct.unpack_from("<H", sys_small, 3)[0] + 9))
+            inner = 0x200 + 135 + len(self.com)
+            f.seek(inner + 3)
+            f.write(struct.pack("<H", 0xE000 + 0x1000 + 9))
+            f.seek(0x200 + old_n)
+            f.write(b"\x5a" * 9)
+            f.seek(0)
+            head = f.read(0xF000)
+        self.assertEqual(ldhdd.existing_boot(head), ldhdd.ExistingBoot(True, 0))
+        tiny = fake_ld_bin(top=0xE800, body_len=0x800)
+        self.assert_refused(v, inputs_from(tiny, self.com))
+        self.quiet_update(v, inputs_from(tiny, self.com), backup=False, force=True)
+        self.assertEqual(read(v)[0x200 + old_n:0x200 + old_n + 9], b"\x5a" * 9)
+
+    def test_legacy_known_payload_trusted(self):
+        # 旧手順で作った起動部 (印なし、MKLDHD.d88 の合体版そのもの) は既知の物として長さを信じる
+        comb = ldhdd.files_from_d88(MKLDHD)["LD.BIN"]
+        v = self.vhd()
+        with open(v, "r+b") as f:
+            mbr = f.read(512)
+            f.seek(0)
+            f.write(ldhdd.boot_record(mbr) + comb)
+            f.seek(0)
+            head = f.read(0xF000)
+        self.assertEqual(ldhdd.existing_boot(head), ldhdd.ExistingBoot(True, len(comb)))
+        # 短い版へ --force なしで置き換えられ、残りは 0 で消える
+        small = fake_ld_bin(top=0xE000, body_len=0x1000)
+        self.quiet_update(v, inputs_from(small, self.com), backup=False)
+        n_small = 0x200 + len(ldhdd.makesys(small, self.com))
+        self.assertEqual(read(v)[n_small:0x200 + len(comb)], bytes(0x200 + len(comb) - n_small))
+
+    def test_legacy_unknown_payload_needs_force(self):
+        comb = bytearray(ldhdd.files_from_d88(MKLDHD)["LD.BIN"])
+        comb[200] ^= 0xFF  # COM の中身を 1 バイト変える (形は MAKESYS のまま)
+        v = self.vhd()
+        with open(v, "r+b") as f:
+            mbr = f.read(512)
+            f.seek(0)
+            f.write(ldhdd.boot_record(mbr) + bytes(comb))
+        self.assert_refused(v)
+        self.quiet_update(v, backup=False, force=True)
+
     @unittest.skipIf(os.name == "nt", "flock のテスト")
     def test_locked_by_other_process(self):
         import subprocess
@@ -610,6 +675,57 @@ class TestUpdate(unittest.TestCase):
         self.assertTrue(os.path.exists(b1) and os.path.exists(b2))
 
 
+class TestWindowsLock(unittest.TestCase):
+    """msvcrt.locking を偽物に差し替えて、記述子の位置が 0 で呼ばれることを確かめる"""
+
+    class FakeMsvcrt:
+        LK_NBLCK = 2
+        LK_UNLCK = 0
+
+        def __init__(self, fail_unlock=False):
+            self.calls = []
+            self.fail_unlock = fail_unlock
+
+        def locking(self, fd, mode, n):
+            self.calls.append((mode, os.lseek(fd, 0, os.SEEK_CUR), n))
+            if mode == self.LK_UNLCK and self.fail_unlock:
+                raise OSError("unlock failed")
+
+    def test_positions(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = os.path.join(td, "x.bin")
+            with open(p, "wb") as f:
+                f.write(bytes(100000))
+            for fail in (False, True):
+                fake = self.FakeMsvcrt(fail_unlock=fail)
+                with open(p, "r+b") as f:
+                    f.read(3000)  # バッファで記述子の位置が先に進む
+                    unlock = ldhdd._lock(f, fake)
+                    f.seek(0)
+                    f.read(100)  # 短い読み戻し (バッファの中で済み、記述子は先にある)
+                    f.seek(0)
+                    unlock()  # 失敗しても例外にしない
+                self.assertEqual(fake.calls, [(2, 0, 0xF000), (0, 0, 0xF000)])
+
+
+class TestDpbLimits(unittest.TestCase):
+    def check(self, bpb, part_sectors):
+        ldhdd.check_fat_bpb(bpb, part_sectors)
+
+    def test_reserved_sectors(self):
+        self.check(bpb_sector(4000, res=255), 4000)
+        with self.assertRaisesRegex(ldhdd.LdhddError, "予約セクタ"):
+            self.check(bpb_sector(4000, res=256), 4000)
+        # 2048 バイトのセクタは HDD.COM が倍にするので 127 まで
+        self.check(bpb_sector(1000, bps=2048, spc=1, root=512, res=127), 4000)
+        with self.assertRaisesRegex(ldhdd.LdhddError, "予約セクタ"):
+            self.check(bpb_sector(1000, bps=2048, spc=1, root=512, res=128), 4000)
+
+    def test_root_dir_sectors(self):
+        with self.assertRaisesRegex(ldhdd.LdhddError, "ルートディレクトリ"):
+            self.check(bpb_sector(20000, root=4096 + 16), 20000)  # 257 セクタ
+
+
 class TestCli(unittest.TestCase):
     def test_ldsys_and_ld_bin_together(self):
         with tempfile.TemporaryDirectory() as td:
@@ -673,11 +789,12 @@ class TestInfo(unittest.TestCase):
 class TestRealLdsys(unittest.TestCase):
     def test_ldsys(self):
         p = os.environ["LDHDD_LDSYS"]
+        # 版を問わない確認: LD.BIN と HDD.COM が読め、合体版を作って分解すると元に戻る
         inp = ldhdd.load_inputs(p, None, None)
-        self.assertEqual(len(inp.ld_bin), 9728)
         self.assertIn("LSX-Dodgers for X1", ldhdd.ld_version(inp.ld_bin))
-        self.assertEqual(inp.com, read(HDD_COM))
         out = ldhdd.makesys(inp.ld_bin, inp.com)
+        si = ldhdd.parse_sys(out)
+        self.assertEqual((si.com, si.ld_bin, si.unit_override), (inp.com, inp.ld_bin, None))
         fixed = {1, 2, 3, 4, 5, 6, 8, 9, 14, 15, 19, 20, 22, 23, 25, 26, 28, 29, 31, 32, 37, 38, 111}
         for i in range(135):
             if i not in fixed:
