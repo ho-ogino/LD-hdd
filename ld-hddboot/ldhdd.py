@@ -1335,6 +1335,7 @@ def new_image(path: str, size: int, inputs: Inputs, input_paths: List[str], unit
 # ---------------------------------------------------------------------------
 
 SHORT_CHARS = set(b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!#$%&'()-@^_`{}~")
+TRAILING_LFN = -1  # DirListing.detached の、ディレクトリの最後に宙に浮いた長い名前の項目の鍵
 DOT_NAME = b".          "
 DOTDOT_NAME = b"..         "
 
@@ -1592,6 +1593,9 @@ class FatVolume:
             if name in (DOT_NAME, DOTDOT_NAME):
                 continue
             entries.append(DirEntry(name, attr, _u16(e, 26), _u32(e, 28), off, _u16(e, 22), _u16(e, 24), long_name))
+        if lfn_offs and end_index is None:
+            # いっぱいのディレクトリの最後に宙に浮いた長い名前の項目: 伸ばした先の最初の項目の直前になる
+            detached[TRAILING_LFN] = list(lfn_offs)
         return DirListing(cluster, offs, entries, free, end_index, detached)
 
     def walk_check(self) -> None:
@@ -1906,7 +1910,8 @@ def execute_add(vol: FatVolume, plan: AddPlan) -> None:
     def write_file(item: NewFile) -> Tuple[int, int]:
         node = item.node
         cs = alloc(_ceil(node.size, vol.csize))
-        fd = os.open(node.path, os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0))
+        fd = os.open(node.path, os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+                     | getattr(os, "O_NONBLOCK", 0))
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode) or (node.ident[1] and (st.st_dev, st.st_ino) != node.ident):
             os.close(fd)
@@ -1979,6 +1984,9 @@ def execute_add(vol: FatVolume, plan: AddPlan) -> None:
             vol.set(last, c)
             data_writes.append((vol.cluster_off(c), bytes(vol.csize)))
             new_slots = [vol.cluster_off(c) + i * 32 for i in range(vol.csize // 32)]
+            trailing = detached_by_dir[cl].pop(TRAILING_LFN, None)
+            if trailing:
+                detached_by_dir[cl][new_slots[0]] = trailing
             slots_by_dir[cl].extend(new_slots)
             slots_by_dir[(cl, "all")] = slots_by_dir[(cl, "all")] + new_slots
         return slots_by_dir[cl].pop(0)
@@ -2020,13 +2028,33 @@ def execute_add(vol: FatVolume, plan: AddPlan) -> None:
             f.seek(vol.fat_off + k * vol.fat_bytes)
             _write_all(f, bytes(vol.fat))
 
-    # 1. データ
+    fat_before = vol.fat_orig  # add を始める前の FAT
+
+    def restore_fats(content: bytes) -> None:
+        """FAT の全部の写しを content に戻す (失敗の後始末。戻せなければそう伝える)"""
+        try:
+            for k in range(vol.nfats):
+                f.seek(vol.fat_off + k * vol.fat_bytes)
+                _write_all(f, content)
+            os.fsync(f.fileno())
+            for k in range(vol.nfats):
+                if _read_at(f, vol.fat_off + k * vol.fat_bytes, vol.fat_bytes) != content:
+                    raise OSError("読み戻しが一致しません")
+        except OSError as e:
+            raise LdhddError("FAT の写しを元に戻せませんでした (%s)。バックアップから戻してください" % e)
+
+    # 1. データ (伸ばしたディレクトリのクラスタの 0 埋めを含む)。FAT でつなぐ前に同期する
     for off, data in data_writes:
         f.seek(off)
         _write_all(f, data)
-    # 2. FAT (全部の写し)。置き換える前のファイルの鎖は、まだ使用中のまま
-    write_fats()
     os.fsync(f.fileno())
+    # 2. FAT (全部の写し)。置き換える前のファイルの鎖は、まだ使用中のまま
+    try:
+        write_fats()
+        os.fsync(f.fileno())
+    except BaseException:
+        restore_fats(fat_before)
+        raise
     # 3. ディレクトリ項目。並べ方はディレクトリの中の順。
     #    a. 宙に浮いた長い名前の項目を消した印にする
     #    b. 今の終わりの印より後ろ (まだ見えない所) と、新しい終わりの印を先に書いて同期する
@@ -2057,23 +2085,36 @@ def execute_add(vol: FatVolume, plan: AddPlan) -> None:
             if _read_at(f, o, 32) != data:
                 raise LdhddError("書いたディレクトリ項目を読み戻したら一致しませんでした")
     except BaseException:
+        restored = True
         for o in reversed(written):
             try:
                 f.seek(o)
                 _write_all(f, originals[o])
             except OSError:
-                pass
+                restored = False
         try:
             os.fsync(f.fileno())
+            restored = restored and all(_read_at(f, o, 32) == originals[o] for o in written)
         except OSError:
-            pass
+            restored = False
+        if not restored:
+            raise LdhddError("ディレクトリ項目を元に戻せませんでした。バックアップから戻してください")
+        # 項目が元に戻ったので、新しく割り当てたクラスタ (伸ばしたディレクトリを含む) も空きに戻す
+        restore_fats(fat_before)
         raise
     # 4. 新しい項目が確かに書けて読み戻せてから、置き換えた前のファイルの鎖を空きに戻す
     if freed:
+        fat_alloc = bytes(vol.fat)
         for c in freed:
             vol.set(c, 0)
-        write_fats()
-        os.fsync(f.fileno())
+        try:
+            write_fats()
+            os.fsync(f.fileno())
+        except BaseException:
+            # 新しい項目はもう書けている。前の鎖は使用中のまま (空きが少し減るだけ) の FAT にそろえる
+            vol.fat[:] = fat_alloc
+            restore_fats(fat_alloc)
+            raise
     # 読み戻し
     for k in range(vol.nfats):
         if _read_at(f, vol.fat_off + k * vol.fat_bytes, vol.fat_bytes) != bytes(vol.fat):

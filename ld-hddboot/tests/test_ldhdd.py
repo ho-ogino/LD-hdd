@@ -1953,10 +1953,15 @@ class TestAdd(unittest.TestCase):
         os.makedirs(os.path.dirname(p2))
         with open(p2, "wb") as fh:
             fh.write(b"new" * 5000)
+        f, vol = self.open_vol(path)
+        free0 = len(vol.free_clusters())
+        f.close()
         orig = ldhdd._write_all
+        state = {"failed": False}
 
         def fail(f, d):
-            if len(d) == 32:  # ディレクトリ項目の書き込み (FAT の後)
+            if len(d) == 32 and not state["failed"]:  # ディレクトリ項目の書き込み (FAT の後) を 1 回だけ失敗させる
+                state["failed"] = True
                 raise OSError(5, "injected")
             return orig(f, d)
         ldhdd._write_all = fail
@@ -1969,6 +1974,7 @@ class TestAdd(unittest.TestCase):
         try:
             vol.walk_check()  # 古い鎖はまだ使用中で、持ち主も 1 つ
             self.assertEqual(vol_read_file(vol, "/A.TXT"), b"old" * 3000)
+            self.assertEqual(len(vol.free_clusters()), free0)  # 新しく割り当てた分も空きに戻った
         finally:
             f.close()
 
@@ -2040,8 +2046,11 @@ class TestAdd(unittest.TestCase):
         path, slots = self.stale_fixture()
         orig = ldhdd._write_all
 
+        state = {"failed": False}
+
         def fail(f, d):
-            if len(d) == 32 and d[0] == 0:  # 終わりの印を置き直す書き込み
+            if len(d) == 32 and d[0] == 0 and not state["failed"]:  # 終わりの印を置き直す書き込み (1 回だけ)
+                state["failed"] = True
                 raise OSError(5, "injected")
             return orig(f, d)
         ldhdd._write_all = fail
@@ -2067,9 +2076,11 @@ class TestAdd(unittest.TestCase):
         with open(p2, "wb") as fh:
             fh.write(b"new")
         orig = ldhdd._write_all
+        state = {"failed": False}
 
         def partial(f, d):
-            if len(d) == 32:  # 項目を 28 バイトだけ書いて失敗する
+            if len(d) == 32 and not state["failed"]:  # 項目を 28 バイトだけ書いて失敗する (1 回だけ)
+                state["failed"] = True
                 orig(f, d[:28])
                 raise OSError(5, "injected")
             return orig(f, d)
@@ -2144,6 +2155,136 @@ class TestAdd(unittest.TestCase):
             self.assertEqual([ldhdd.short_to_text(x.name) for x in vol.read_dir(vol.resolve_dir("/H")).entries], ["OK.TXT"])
         finally:
             f.close()
+
+    def test_fat_mirror_write_failure_restores(self):
+        # 2 つ目の FAT の写しの書き込みを 1 回だけ失敗させる: 割り当ての時と、置き換えの後始末の時
+        for phase in ("alloc", "cleanup"):
+            path = self.vhd(name="fm_%s.vhd" % phase)
+            self.add(path, [self.put("A.TXT", b"old" * 3000)])
+            f, vol = self.open_vol(path)
+            free0, fat_bytes, fat_off = len(vol.free_clusters()), vol.fat_bytes, vol.fat_off
+            f.close()
+            p2 = os.path.join(self.dir, "fm", phase, "A.TXT")
+            os.makedirs(os.path.dirname(p2))
+            with open(p2, "wb") as fh:
+                fh.write(b"new" * 5000)
+            orig = ldhdd._write_all
+            state = {"n": 0, "failed": False}
+            target_call = 2 if phase == "alloc" else 4  # FAT の書き込みは 写し1, 写し2 (割り当て), 写し1, 写し2 (後始末)
+
+            def fail(fh, d):
+                if len(d) == fat_bytes and not state["failed"]:
+                    state["n"] += 1
+                    if state["n"] == target_call:
+                        state["failed"] = True
+                        raise OSError(5, "injected")
+                return orig(fh, d)
+            ldhdd._write_all = fail
+            try:
+                with self.assertRaisesRegex(ldhdd.LdhddError, "injected"):
+                    self.add(path, [p2], overwrite=True)
+            finally:
+                ldhdd._write_all = orig
+            f, vol = self.open_vol(path)  # 写しが食い違っていれば、ここで開けない
+            try:
+                vol.walk_check()
+                if phase == "alloc":
+                    self.assertEqual(vol_read_file(vol, "/A.TXT"), b"old" * 3000)
+                    self.assertEqual(len(vol.free_clusters()), free0)
+                else:
+                    self.assertEqual(vol_read_file(vol, "/A.TXT"), b"new" * 5000)
+            finally:
+                f.close()
+
+    def test_directory_failure_releases_allocations(self):
+        path = self.vhd()
+        f, vol = self.open_vol(path)
+        free0 = len(vol.free_clusters())
+        f.close()
+        orig = ldhdd._write_all
+        state = {"failed": False}
+
+        def fail(fh, d):
+            if len(d) == 32 and not state["failed"]:
+                state["failed"] = True
+                raise OSError(5, "injected")
+            return orig(fh, d)
+        ldhdd._write_all = fail
+        try:
+            with self.assertRaisesRegex(ldhdd.LdhddError, "injected"):
+                self.add(path, [self.put("BIG.BIN", b"z" * 20000)])
+        finally:
+            ldhdd._write_all = orig
+        f, vol = self.open_vol(path)
+        try:
+            self.assertEqual(len(vol.free_clusters()), free0)
+            self.assertEqual(vol.read_dir(0).entries, [])
+        finally:
+            f.close()
+
+    def test_trailing_detached_long_name_on_growth(self):
+        # いっぱいのサブディレクトリの最後に宙に浮いた長い名前があっても、伸ばした先の項目に付かない
+        path = self.vhd()  # 4KB クラスタ = 128 項目
+        for i in range(126):  # . と .. と 126 個 = 128 個でいっぱい
+            self.put(os.path.join("FULL", "F%d.TXT" % i), b"%d" % i)
+        self.add(path, [os.path.join(self.src, "FULL")])
+        with open(path, "r+b") as f:
+            vol = ldhdd.FatVolume(f)
+            listing = vol.read_dir(vol.resolve_dir("/FULL"))
+            self.assertEqual(listing.free, [])
+            last = listing.slots[-1]
+            units = [ord(c) for c in "Old.com"] + [0] + [0xFFFF] * 5
+            e = bytearray(32)
+            e[0], e[11], e[13] = 0x41, 0x0F, ldhdd._lfn_checksum(b"HDD     COM")
+            b = struct.pack("<13H", *units)
+            e[1:11], e[14:26], e[28:32] = b[0:10], b[10:22], b[22:26]
+            f.seek(last)
+            f.write(bytes(e))  # 最後の項目 (F125.TXT) を宙に浮いた長い名前にする
+        self.put(os.path.join("MORE", "FULL", "HDD.COM"), b"h")
+        self.add(path, [os.path.join(self.src, "MORE", "FULL")])
+        with open(path, "rb") as f:
+            vol = ldhdd.FatVolume(f)
+            ent = vol.find(vol.read_dir(vol.resolve_dir("/FULL")), b"HDD     COM")
+            self.assertIsNotNone(ent)
+            self.assertIsNone(ent.long_name)
+
+    def test_extension_zero_fill_synced_before_fat(self):
+        path = self.vhd()
+        for i in range(126):
+            self.put(os.path.join("FULL", "F%d.TXT" % i), b"%d" % i)
+        self.add(path, [os.path.join(self.src, "FULL")])
+        events = []
+        orig_w, orig_s = ldhdd._write_all, ldhdd.os.fsync
+        f0, vol0 = self.open_vol(path)
+        fat_bytes = vol0.fat_bytes
+        f0.close()
+        ldhdd._write_all = lambda fh, d: (events.append("fat" if len(d) == fat_bytes else "w"), orig_w(fh, d))[1]
+        ldhdd.os.fsync = lambda fd: (events.append("sync"), orig_s(fd))[1]
+        try:
+            self.put(os.path.join("MORE", "FULL", "X.TXT"), b"x")
+            self.add(path, [os.path.join(self.src, "MORE", "FULL")])
+        finally:
+            ldhdd._write_all, ldhdd.os.fsync = orig_w, orig_s
+        first_fat = events.index("fat")
+        self.assertIn("sync", events[:first_fat])  # データ (0 埋めを含む) を同期してから FAT を書く
+        self.assertEqual(events[first_fat - 1], "sync")
+
+    @unittest.skipIf(os.name == "nt", "FIFO のテスト")
+    def test_source_replaced_by_fifo(self):
+        path = self.vhd()
+        p = self.put("R.TXT", b"real")
+        orig = ldhdd.plan_add
+
+        def plan_then_fifo(*a, **kw):
+            r = orig(*a, **kw)
+            os.remove(p)
+            os.mkfifo(p)
+            return r
+        ldhdd.plan_add = plan_then_fifo
+        try:
+            self.assert_refused(path, [p], "置き換わりました")
+        finally:
+            ldhdd.plan_add = orig
 
     def test_timestamps(self):
         path = self.vhd()
