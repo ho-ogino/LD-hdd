@@ -1189,7 +1189,10 @@ class TestNewParts(unittest.TestCase):
     def test_forced_fat(self):
         mb = 2048
         lay = ldhdd.choose_fat_layout(128 * mb - 128, "12")
-        self.assertEqual((lay.fat_bits, lay.spc, lay.clusters), (12, 128, 2046))
+        self.assertEqual((lay.fat_bits, lay.spc), (12, 128))
+        self.assertLess(lay.clusters, 4085)
+        # データ領域の位置が 2 クラスタ分 (256 セクタ) 以上になるよう、予約セクタを足している
+        self.assertGreaterEqual(lay.reserved + 2 * lay.spf + 32, 2 * lay.spc)
         with self.assertRaisesRegex(ldhdd.LdhddError, "FAT12 にできません"):
             ldhdd.choose_fat_layout(512 * mb - 128, "12")
         with self.assertRaisesRegex(ldhdd.LdhddError, "FAT16 にできません"):
@@ -1287,6 +1290,71 @@ class TestNew(unittest.TestCase):
         with open(path, "rb") as f:
             f.seek(0x200)
             self.assertEqual(f.read(len(ldhdd.makesys(ld2, self.com))), ldhdd.makesys(ld2, self.com))
+
+    def test_forced_fat12_128m_end_to_end(self):
+        path, lay = self.new("f12.vhd", "128M", fat="12")
+        self.assertEqual((lay.fat_bits, lay.spc), (12, 128))
+        # update --dry-run (A1 の検査) も通る
+        self.assertEqual(run_main(["update", path, "--dry-run", "--ldsys", MKLDHD, "--ld-bin", self.raw_ld()]), 0, run_main.err)
+        if shutil.which("fsck.fat"):
+            self.assertEqual(self.fsck(path), 0)
+
+    def raw_ld(self):
+        p = os.path.join(self.dir, "rawld.bin")
+        if not os.path.exists(p):
+            with open(p, "wb") as f:
+                f.write(self.ld)
+        return p
+
+    def fsck(self, path):
+        import subprocess
+        data = read(path)
+        part = os.path.join(self.dir, "part.img")
+        with open(part, "wb") as f:
+            f.write(data[128 * 512:len(data) - 512])
+        r = subprocess.run([shutil.which("fsck.fat"), "-n", part], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        os.remove(part)
+        return r.returncode
+
+    def test_info_truncated_and_fat32(self):
+        # パーティションがファイルの外 / FAT32 の BPB でも info は落ちない
+        path = os.path.join(self.dir, "x.vhd")
+        mbr = bytearray(512)
+        mbr[0x1BE:0x1CE] = struct.pack("<B3sB3sII", 0, b"\0\0\0", 0x06, b"\0\0\0", 5000, 100)
+        mbr[510:512] = b"\x55\xaa"
+        with open(path, "wb") as f:
+            f.write(bytes(mbr) + bytes(0x10000))
+        self.assertEqual(run_main(["info", path]), 0, run_main.err)
+        self.assertIn("BPB を読めません", run_main.out)
+        path2, lay = self.new("y.vhd", "16M")
+        with open(path2, "r+b") as f:
+            f.seek(128 * 512 + 22)
+            f.write(b"\0\0")  # FAT16 の spf を 0 に (FAT32 の形)
+        self.assertEqual(run_main(["info", path2]), 0, run_main.err)
+        self.assertIn("FAT32", run_main.out)
+
+    def test_failed_creator_keeps_others_output(self):
+        # 失敗した時の後始末は、自分が作ったファイルのままの時だけ消す
+        path = os.path.join(self.dir, "n.vhd")
+        orig = ldhdd._write_all
+        calls = []
+
+        def fail(f, d):
+            calls.append(1)
+            if len(calls) == 2:
+                other = os.path.join(self.dir, "other.tmp")
+                with open(other, "wb") as o:
+                    o.write(b"other")
+                os.replace(other, path)  # ほかの誰かがその名前に置いた
+                raise OSError(5, "I/O error")
+            return orig(f, d)
+        ldhdd._write_all = fail
+        try:
+            with self.assertRaises(ldhdd.LdhddError):
+                self.new()
+        finally:
+            ldhdd._write_all = orig
+        self.assertEqual(read(path), b"other")
 
     @unittest.skipUnless(shutil.which("fsck.fat"), "fsck.fat が無い")
     def test_fsck_fat(self):
@@ -1421,7 +1489,10 @@ class TestNew(unittest.TestCase):
         with open(path, "rb") as f:
             f.seek(0x200)
             self.assertEqual(f.read(135 + 1254 + 9728)[135:135 + 1254], ldhdd.files_from_d88(MKLDHD)["HDD.COM"])
-        self.assertEqual(run_main(["new", path, "--size", "2M", "--ldsys", MKLDHD]), 1)
+        before = sha(path)
+        self.assertEqual(run_main(["new", path, "--size", "2M", "--ldsys", MKLDHD, "--ld-bin", p_ld]), 1)
+        self.assertIn("既にあります", run_main.err)
+        self.assertEqual(sha(path), before)
 
 
 @unittest.skipUnless(os.environ.get("LDHDD_LDSYS"), "LDHDD_LDSYS が無い")

@@ -973,12 +973,35 @@ def _update_locked(f, target, inputs, sys_bin, unit, backup, force, dry_run, out
     return bak
 
 
+def describe_fat(pb: bytes, p1: "Partition", vk: VhdKind) -> str:
+    """第 1 パーティションの BPB を info 用に説明する (壊れていても例外にしない)"""
+    if len(pb) < 62:
+        return "BPB を読めません (パーティションがファイルの外)"
+    if not looks_like_bpb(pb):
+        return "BPB がありません"
+    bps, spc, res, nf, root = _u16(pb, 11), pb[13], _u16(pb, 14), pb[16], _u16(pb, 17)
+    spf = _u16(pb, 22)
+    tot = _u16(pb, 19) or _u32(pb, 32)
+    if spf == 0:
+        return "FAT32 など (HDD.COM では使えません)"
+    if not bps or not spc:
+        return "BPB が壊れています"
+    ds = res + nf * spf + (root * 32 + bps - 1) // bps
+    cl = (tot - ds) // spc if tot > ds else 0
+    return ("FAT%d、クラスタ %d バイト x %d (データ %.1fMB)、ラベル %s"
+            % (12 if cl < 4085 else 16, bps * spc, cl, cl * bps * spc / 1048576.0,
+               pb[43:54].decode("ascii", "replace").rstrip()))
+
+
 def info(target: str, out=None) -> None:
     if out is None:
         out = sys.stdout
     with _open_target(target, False) as f:
         vk = vhd_kind_of(f)
         head = _read_at(f, 0, IPL_LOAD_SIZE)
+        p1 = read_partitions(head)[0] if len(head) >= SECTOR else None
+        pb1 = (_read_at(f, p1.lba * SECTOR, SECTOR)
+               if p1 is not None and p1.ptype and (p1.lba + 1) * SECTOR <= vk.data_size else b"")
     print("対象      : %s (%s, データ %d バイト)" % (target, "固定 VHD" if vk.kind == "fixed" else "フッター無しの生イメージ", vk.data_size), file=out)
     if len(head) < SECTOR or head[510:512] != b"\x55\xaa":
         print("MBR       : なし", file=out)
@@ -988,16 +1011,7 @@ def info(target: str, out=None) -> None:
                 print("パーティション %d: 種類 %02X 開始 LBA %d (%d バイト目) %d セクタ" % (p.index, p.ptype, p.lba, p.lba * SECTOR, p.count), file=out)
         p1 = read_partitions(head)[0]
         if p1.ptype:
-            with _open_target(target, False) as f:
-                pb = _read_at(f, p1.lba * SECTOR, SECTOR)
-            if looks_like_bpb(pb):
-                bps, spc = _u16(pb, 11), pb[13]
-                tot = _u16(pb, 19) or _u32(pb, 32)
-                ds = _u16(pb, 14) + pb[16] * _u16(pb, 22) + (_u16(pb, 17) * 32 + bps - 1) // max(bps, 1)
-                cl = (tot - ds) // spc if spc and tot > ds else 0
-                print("FAT       : FAT%d、クラスタ %d バイト x %d (データ %.1fMB)、ラベル %s"
-                      % (12 if cl < 4085 else 16, bps * spc, cl, cl * bps * spc / 1048576.0,
-                         pb[43:54].decode("ascii", "replace").rstrip()), file=out)
+            print("FAT       : %s" % describe_fat(pb1, p1, vk), file=out)
     ex = existing_boot(head)
     if not ex.present:
         print("起動部    : なし", file=out)
@@ -1051,6 +1065,7 @@ class FatLayout(NamedTuple):
     spf: int
     clusters: int
     total: int  # パーティションのセクタ数
+    reserved: int = NEW_RESERVED
 
 
 def _fat_layout_for(total: int, spc: int, bits: int) -> Optional[FatLayout]:
@@ -1058,12 +1073,15 @@ def _fat_layout_for(total: int, spc: int, bits: int) -> Optional[FatLayout]:
     root_secs = NEW_ROOT * 32 // SECTOR
     spf = 1
     while True:
-        data_start = NEW_RESERVED + NEW_NFATS * spf + root_secs
+        # LSX-Dodgers の DPB_ADDCL (= データ領域の位置 - 2 クラスタ) が負にならないよう、
+        # 足りなければ予約セクタを足してデータ領域を 2 クラスタ分より後ろにする
+        reserved = max(NEW_RESERVED, 2 * spc - NEW_NFATS * spf - root_secs)
+        data_start = reserved + NEW_NFATS * spf + root_secs
         if data_start >= total:
             return None
         clusters = (total - data_start) // spc
         if spf * SECTOR >= ((clusters + 2) * bits + 7) // 8:
-            return FatLayout(bits, spc, spf, clusters, total)
+            return FatLayout(bits, spc, spf, clusters, total, reserved)
         spf += 1
 
 
@@ -1091,6 +1109,10 @@ def choose_fat_layout(total: int, fat: str = "auto") -> FatLayout:
             raise LdhddError("この容量 (パーティション %d セクタ) は FAT16 にできません" % total)
     else:
         raise LdhddError("--fat は auto / 12 / 16 です (%r)" % (fat,))
+    try:
+        check_fat_bpb(build_bpb(lay, NEW_PART_LBA, NO_LABEL, 0), total)
+    except LdhddError as e:
+        raise LdhddError("この容量 (パーティション %d セクタ) では、HDD.COM で使える FAT%s にできません (%s)" % (total, fat, e))
     return lay
 
 
@@ -1115,7 +1137,7 @@ def build_bpb(lay: FatLayout, part_lba: int, label: bytes, volume_id: int) -> by
     b[0:3] = b"\xeb\x3c\x90"
     b[3:11] = b"MSDOS5.0"
     tot16 = lay.total if lay.total < 0x10000 else 0
-    struct.pack_into("<HBHBHHBHHHI", b, 11, SECTOR, lay.spc, NEW_RESERVED, NEW_NFATS, NEW_ROOT,
+    struct.pack_into("<HBHBHHBHHHI", b, 11, SECTOR, lay.spc, lay.reserved, NEW_NFATS, NEW_ROOT,
                      tot16, NEW_MEDIA, lay.spf, 63, 255, part_lba)
     struct.pack_into("<I", b, 32, 0 if tot16 else lay.total)
     b[36] = 0x80  # ドライブ番号
@@ -1230,6 +1252,7 @@ def new_image(path: str, size: int, inputs: Inputs, input_paths: List[str], unit
             raise LdhddError("%s は既にあります。置き換えるなら --force を付けてください" % path)
         created = path
     committed = False
+    mine = os.fstat(fd)
     try:
         with os.fdopen(fd, "r+b", buffering=0) as f:
             f.truncate(size)
@@ -1237,10 +1260,10 @@ def new_image(path: str, size: int, inputs: Inputs, input_paths: List[str], unit
                 f.seek(off)
                 _write_all(f, data)
             for k in range(NEW_NFATS):
-                f.seek(base + (NEW_RESERVED + k * lay.spf) * SECTOR)
+                f.seek(base + (lay.reserved + k * lay.spf) * SECTOR)
                 _write_all(f, fat_head(lay))
             if label is not None:
-                f.seek(base + (NEW_RESERVED + NEW_NFATS * lay.spf) * SECTOR)
+                f.seek(base + (lay.reserved + NEW_NFATS * lay.spf) * SECTOR)
                 _write_all(f, label_b + bytes([0x08]) + bytes(20))
             f.seek(size)
             _write_all(f, footer)
@@ -1253,8 +1276,10 @@ def new_image(path: str, size: int, inputs: Inputs, input_paths: List[str], unit
         committed = True
     except BaseException as e:
         if not committed:
+            # 自分が作ったファイルがその名前のままの時だけ消す
             try:
-                os.remove(created)
+                if os.path.samestat(os.stat(created), mine):
+                    os.remove(created)
             except OSError:
                 pass
         if isinstance(e, OSError):
