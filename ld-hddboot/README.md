@@ -37,11 +37,11 @@ python3 ldhdd.py new LDHDD.vhd --size 128M --ldsys ldsys.d88
 ### ファイルやフォルダをVHDに入れる
 
 ```
-python3 ldhdd.py add LDHDD.vhd SLANGIDE README.TXT
+python3 ldhdd.py add LDHDD.vhd MYAPP README.TXT
 python3 ldhdd.py ls LDHDD.vhd -R
 ```
 
-- `add` は、指定したファイルやフォルダを、VHDの第1パーティション（FAT12/16）に入れます。フォルダはその名前のフォルダとして中身ごと入ります（`SLANGIDE` → `/SLANGIDE/...`）。
+- `add` は、指定したファイルやフォルダを、VHDの第1パーティション（FAT12/16）に入れます。フォルダはその名前のフォルダとして中身ごと入ります（`MYAPP` → `/MYAPP/...`）。
 - `--to /DIR` で入れる先のフォルダを指定できます（無ければ作ります）。
 - 名前は8.3（名前8文字まで、拡張子3文字まで）で、ASCIIの英数字と `! # $ % & ' ( ) - @ ^ _ ` { } ~` だけです。英小文字は大文字になります。
   - 合わない名前があれば、全部並べて止まります（勝手に縮めません）。
@@ -54,7 +54,7 @@ python3 ldhdd.py ls LDHDD.vhd -R
   - `info` の「FAT の写し」の行で、そろっているかどうかが分かります。
 - `update` と同じく、書く前にVHD全体のバックアップを取ります（`--no-backup` で省略）。`--dry-run` で、何を入れるかだけを表示します。
 - ファイルの日時は、元のファイルの更新日時（そのPCの時刻）です。
-- `ls` は中身を表示します（`ls LDHDD.vhd /SLANGIDE`、`-R` で下のフォルダも）。
+- `ls` は中身を表示します（`ls LDHDD.vhd /MYAPP`、`-R` で下のフォルダも）。
 - `update` と同じく、`add` の実行中に別のプログラムが同時に、入れる元のファイルやフォルダ（シンボリックリンクへの差し替えなど）やVHDを書き換える場合は、このツールの対象外です（調べた時と別の物になったファイルは、書き込む前に止めます）。
 
 ### 既存のVHDを起動できるようにする / 起動するLSX-Dodgersを更新する
