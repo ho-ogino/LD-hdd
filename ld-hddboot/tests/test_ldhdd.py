@@ -681,7 +681,7 @@ class TestUpdate(unittest.TestCase):
         self.assertEqual(read(v)[0x200 + old_n:0x200 + old_n + 9], b"\x5a" * 9)
 
     def test_same_end_shift_not_trusted(self):
-        # 外側と中の終わりを同じだけ伸ばすと、ヘッダとスタブは噛み合ってしまう (R3-F1)。印で見破る
+        # 外側と中の終わりを同じだけ伸ばすと、ヘッダとスタブは噛み合ってしまう。印で見破る
         small = fake_ld_bin(top=0xE000, body_len=0x1000)
         v = self.vhd()
         self.quiet_update(v, inputs_from(small, self.com), backup=False)
